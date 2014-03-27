@@ -1,0 +1,26 @@
+{
+  "name": "npm-postgres-mashup",
+  "author": "Rick Bergfalk <rick.bergfalk@gmail.com>",
+  "description": "npm-postgres-mashup does a one-time replication of most of npm's data to postgres",
+  "version": "1.0.0",
+  "main": "npm-postgres-mashup",
+  "keywords": [
+  	"npm",
+    "postgres",
+    "replication"
+  ],
+  "scripts": {
+    "test": "node test.js"
+  },
+  "dependencies": {
+    "cradle": "0.6.x",
+    "knex": "^0.5.8",
+    "pg": "^2.11.1",
+    "async": "^0.2.10",
+    "postgrator": "^0.2.0"
+  },
+  "repository" : {
+    "type": "git", 
+    "url": "git://github.com/rickbergfalk/npm-postgres-mashup.git"
+  }
+}
