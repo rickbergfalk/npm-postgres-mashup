@@ -2,7 +2,7 @@
   "name": "npm-postgres-mashup",
   "author": "Rick Bergfalk <rick.bergfalk@gmail.com>",
   "description": "npm-postgres-mashup does a one-time replication of most of npm's data to postgres",
-  "version": "1.0.0",
+  "version": "14.16.13",
   "main": "npm-postgres-mashup",
   "keywords": [
   	"npm",
