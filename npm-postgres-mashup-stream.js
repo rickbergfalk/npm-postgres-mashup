@@ -20,11 +20,12 @@ var postgresPassword;
 var postgresDatabase;
 var beNoisy = false;              // if set to true we'll console.log progress
 var logFile = __dirname + "/error-log.txt";
-var theFinalCallback;
+var stopOnCatchup = false;
+var onCatchup;
 
 var feed; // follow feed
 var startingSeq = 1;
-
+var parallelLimit = 1;
 var emptyPostgres = false;
 
 /*     Maybe Say
@@ -67,8 +68,8 @@ exports.copyTheData = function (config) {
     postgresPassword = config.postgresPassword;
     if (config.logFile) logFile = config.logFile;
     if (config.beNoisy) beNoisy = true;
-    if (config.theFinalCallback) theFinalCallback = config.theFinalCallback;
-    
+    if (config.onCatchup) onCatchup = config.onCatchup;
+    if (config.stopOnCatchup) stopOnCatchup = true;
     if (config.emptyPostgres) emptyPostgres = true;
     
     // clear out the log file for this run
@@ -103,19 +104,28 @@ function initPostgres () {
         username: postgresUser,
         password: postgresPassword
     });
-    postgrator.migrate('002', function (err, migrations) {
-        if (err) takeNote("Migrating up to 002", "", err);
+    postgrator.migrate('002', function (err) {
+        if (err) {
+            takeNote("Migrating up to 002", "", err);
+            throw(err); // if we can't migrate, there is no use in continuing.
+        }
         knex('load_log').max('seq').exec(function (err, res) {
-            if (err) console.log(err);
+            if (err) maybeSay(err);
             if (res && res[0] && res[0].max && !emptyPostgres) {
                 startingSeq = res[0].max;
                 followCouch();
             } else {
                 maybeSay("Either max seq is not present, or user opted to empty postgres");
-                postgrator.migrate('000', function (err, migrations) {
-                    if (err) takeNote("Migrating down to 000", "", err);
-                    postgrator.migrate('002', function (err, migrations) {
-                        if (err) takeNote("Migrating up to 002", "", err);
+                postgrator.migrate('000', function (err) {
+                    if (err) { 
+                        takeNote("Migrating down to 000", "", err);
+                        throw(err); // if we can't migrate there is no use going forward
+                    }
+                    postgrator.migrate('002', function (err) {
+                        if (err) {
+                            takeNote("Migrating up to 002", "", err);
+                            throw(err);
+                        }
                         followCouch();
                     });
                 });
@@ -126,10 +136,10 @@ function initPostgres () {
 
 var changesProcessing = 0;    
 function manageFlow () {
-    if (changesProcessing >= 10 && !feed.is_paused) {
+    if (changesProcessing >= parallelLimit && !feed.is_paused) {
         // pause processing til we drop down below 10
         feed.pause();
-    } else if (changesProcessing < 10 && feed.is_paused) {
+    } else if (changesProcessing < parallelLimit && feed.is_paused) {
         feed.resume();
     }
 }
@@ -139,7 +149,7 @@ function manageFlow () {
     Once all the changes are gotten, we iterate over them
 ============================================================================= */
 function followCouch () {
-    console.log("starting on sequence " + startingSeq);
+    maybeSay("starting on sequence " + startingSeq);
     var opts = {
         db: couchUrl,
         since: startingSeq, 
@@ -159,13 +169,14 @@ function followCouch () {
     });
     
     feed.on('error', function(err) {
-      console.error('Since Follow always retries on errors, this must be serious');
-      throw err;
+        takeNote("follow feed error", "", err);
+        console.error('Follow Feed Error: Since Follow always retries, this must be serious');
+        throw err;
     });
     
     feed.on('confirm', function (db) {
-        console.log('db confirmed');
-        console.log(db); 
+        maybeSay("npm db confirmed:");
+        maybeSay(db); 
         //db.doc_count;
         //db.doc_del_count;
         //db.disk_size;
@@ -174,11 +185,15 @@ function followCouch () {
     });
     
     feed.on('catchup', function (seq_id) {
-        console.log('all caught up');
+        maybeSay('all caught up. last sequence: ' + seq_id);
+        if (onCatchup) onCatchup();
+        if (stopOnCatchup) {
+            feed.stop();
+            process.exit();
+        }
     });
 
     feed.follow();
-    
 }
 
 
@@ -189,7 +204,7 @@ function followCouch () {
 function persistToPg (change, cb) {
     changeCount++;
     var doc = change.doc;
-    if (changeCount % 1000 === 0) {
+    if (changeCount % 10 === 0) {
         maybeSay("changeCount: " + changeCount);   
     }
 
@@ -280,18 +295,18 @@ function persistToPg (change, cb) {
                     dependency_name: d,
                     dependency_version: dv.dependencies[d]
                 });
-            };
+            }
         }
 
         if (dv.devDependencies) {
-            for (var d in dv.devDependencies) {
+            for (var devdep in dv.devDependencies) {
                 sqlInserts.versionDevDependencies.push({
                     package_name: doc._id,
                     version: v,
-                    dev_dependency_name: d,
-                    dev_dependency_version: dv.devDependencies[d]
+                    dev_dependency_name: devdep,
+                    dev_dependency_version: dv.devDependencies[devdep]
                 });
-            };    
+            }
         }
 
         if (dv.keywords && dv.keywords.length && dv.keywords instanceof Array) {
@@ -345,78 +360,102 @@ function persistToPg (change, cb) {
         to bootstrap the waterfall with the sqlInserts data.
         Is there not a way to start an async.waterfall with some data?
     -----------------------------------------------------------*/
-    /*
+    
     knex.transaction(function(t) {
-        
+        sqlInserts.transaction = t;
+        var delete_start;
+        var delete_finish;
+        var inserts_start;
+        var inserts_finish;
+        async.waterfall([
+            function (next) {
+                delete_start = new Date();
+                knex("package").transacting(sqlInserts.transaction).where('package_name', doc._id).del().exec(function (err) {
+                    delete_finish = new Date();
+                    if (err) maybeSay(err);
+                    inserts_start = new Date();
+                    next(null, sqlInserts);
+                });
+            },
+            function insertPackage (inserts, next) {
+                knex("package").transacting(inserts.transaction).insert(inserts.package).exec(function (err) { 
+                    if (err) takeNote("package.insert()", inserts.package.package_name, err);
+                    next(err, inserts);
+                });
+            },
+            function insertVersions (inserts, next) {
+                insertIfNecessary(inserts, next, "version", "versions");
+            },
+            function insertVersionContributors (inserts, next) {
+                insertIfNecessary(inserts, next, "version_contributor", "versionContributors");
+            },
+            function insertVersionMaintainers (inserts, next) {
+                insertIfNecessary(inserts, next, "version_maintainer", "versionMaintainers");
+            },
+            function insertVersionDependencies (inserts, next) {
+                insertIfNecessary(inserts, next, "version_dependency", "versionDependencies");
+            },
+            function insertVersionDevDependencies (inserts, next) {
+                insertIfNecessary(inserts, next, "version_dev_dependency", "versionDevDependencies");
+            },
+            function insertVersionKeywords (inserts, next) {
+                insertIfNecessary(inserts, next, "version_keyword", "versionKeywords");
+            },
+            function insertVersionBins (inserts, next) {
+                insertIfNecessary(inserts, next, "version_bin", "versionBins");
+            },
+            function insertVersionScripts (inserts, next) {
+                insertIfNecessary(inserts, next, "version_script", "versionScripts");
+            }
+        ], function (err) {
+            inserts_finish = new Date();
+            var load_log = {
+                seq: change.seq,
+                package_name: sqlInserts.package.package_name,
+                version_latest: sqlInserts.package.version_latest,
+                delete_start: delete_start,
+                delete_finish: delete_finish,
+                inserts_start: inserts_start,
+                inserts_finish: inserts_finish
+            };
+            
+            // log to postgres
+            // it doesn't need to prevent the rest of the process from continuing
+            knex("load_log").where("seq", load_log.seq).del().exec(function (err) {
+                if (err) maybeSay("error deleting load_log.seq. shouldn't need to do this...");
+                knex("load_log").insert(load_log).exec(function (err) {
+                    if (err) {
+                        maybeSay("Couldn't log load activity in load_log. See error log for details.");
+                        takeNote("load_log.insert()", sqlInserts.package.package_name, err);
+                    }
+                });
+            });
+            
+            // handle error, and continue on regardless
+            if (err) {
+                maybeSay("An insert failed somewhere - check log for details");
+                maybeSay("rolling back");
+                t.rollback();
+                errorCount++;
+                if (errorCount < errorLimit) {
+                    cb();
+                } else {
+                    console.log("Too many errors! Stopping this thing.");
+                    process.exit();
+                }
+            } else {
+                t.commit('');
+                cb();
+            }
+            
+        });
     }).then(function () {
         // it was committed? 
-        // Normally we'd continue here, but I think that's happening somewhere else
+        // Normally we'd continue here, but I'm not using the promises api so that's happening somewhere else
         // promise-flow is messing with my callback flow :(
-    }, function () {
-        console.log('error - rolled back'); 
+    }, function (err) {
+        maybeSay('rolled back: ' + (err || '')); 
     });
-    */
-    
-    var delete_start;
-    var delete_finish;
-    var inserts_start;
-    var inserts_finish;
-    async.waterfall([
-        function (next) {
-            delete_start = new Date();
-            knex("package").where('package_name', doc._id).del().exec(function (err, res) {
-                delete_finish = new Date();
-                if (err) console.log(err);
-                inserts_start = new Date();
-                next(null, sqlInserts);
-            });
-        },
-        insertPackage,
-        insertVersions,
-        insertVersionContributors,
-        insertVersionDependencies,
-        insertVersionDevDependencies,
-        insertVersionKeywords,
-        insertVersionMaintainers,
-        insertVersionBins,
-        insertVersionScripts
-    ], function (err, result) {
-        inserts_finish = new Date();
-        var load_log = {
-            seq: change.seq,
-            package_name: sqlInserts.package.package_name,
-            version_latest: sqlInserts.package.version_latest,
-            delete_start: delete_start,
-            delete_finish: delete_finish,
-            inserts_start: inserts_start,
-            inserts_finish: inserts_finish
-        }
-        // log to postgres
-        // it doesn't need to prevent the rest of the process from continuing
-        knex("load_log").where("seq", load_log.seq).del().exec(function (err, res) {
-            knex("load_log").insert(load_log).exec(function (err, res) {
-                if (err) {
-                    console.log("Couldn't log load activity in load_log. See error log for details.");
-                    takeNote("load_log.insert()", sqlInserts.package.package_name, err);
-                }
-            });
-        });
-        
-        // handle error, and continue on regardless
-        if (err) {
-            console.log("An insert failed somewhere - check log for details");
-            errorCount++;
-            if (errorCount < errorLimit) {
-                cb();
-            } else {
-                console.log("Too many errors! Stopping this thing.");
-                process.exit();
-            }
-        } else {
-            cb();
-        }
-    });
-
 }
 
 
@@ -426,118 +465,15 @@ function persistToPg (change, cb) {
     If not, the insert is skipped, 
     and the callback is called via a setImmediate to remain async'y
 ============================================================================= */
-
-function insertPackage (inserts, next) {
-    knex("package").insert(inserts.package).exec(function (err, res) { 
-        if (err) {
-            takeNote("package.insert()", inserts.package.package_name, err);
-            next(err);
-        } else {
-            next(null, inserts);
-        }
-    });
-}
-
-function insertVersions (inserts, next) {
-    if (inserts.versions.length) {
-        knex("version").insert(inserts.versions).exec(function (err, res) {
-            if (err) takeNote("version.insert()", inserts.package.package_name, err);
+function insertIfNecessary (inserts, next, table, insertsProperty) {
+    if (inserts[insertsProperty].length) {
+        knex(table).transacting(inserts.transaction).insert(inserts[insertsProperty]).exec(function (err) {
+            if (err) takeNote(table + ".insert()", inserts.package.package_name, err);
             next(err, inserts);
         });
     } else {
         setImmediate(function () {
             next(null, inserts);
         });
-    }
-}
-
-function insertVersionContributors (inserts, next) {
-    if (inserts.versionContributors.length) {
-        knex("version_contributor").insert(inserts.versionContributors).exec(function (err, res) {
-            if (err) takeNote("version_contributor.insert()", inserts.package.package_name, err);
-            next(err, inserts);
-        });        
-    } else {
-        setImmediate(function () {
-            next(null, inserts);
-        });    
-    }
-}
-
-function insertVersionMaintainers (inserts, next) {
-    if (inserts.versionMaintainers.length) {
-        knex("version_maintainer").insert(inserts.versionMaintainers).exec(function (err, res) {
-            if (err) takeNote("version_maintainer.insert()", inserts.package.package_name, err);
-            next(err, inserts);
-        });        
-    } else {
-        setImmediate(function () {
-            next(null, inserts);
-        });    
-    }
-}
-
-function insertVersionDependencies (inserts, next) {
-    if (inserts.versionDependencies.length) {
-        knex("version_dependency").insert(inserts.versionDependencies).exec(function (err, res) {
-            if (err) takeNote("version_dependency.insert()", inserts.package.package_name, err);
-            next(err, inserts);
-        });        
-    } else {
-        setImmediate(function () {
-            next(null, inserts);
-        });    
-    }
-}
-
-function insertVersionDevDependencies (inserts, next) {
-    if (inserts.versionDevDependencies.length) {
-        knex("version_dev_dependency").insert(inserts.versionDevDependencies).exec(function (err, res) {
-            if (err) takeNote("version_dev_dependency.insert()", inserts.package.package_name, err);
-            next(err, inserts);
-        });        
-    } else {
-        setImmediate(function () {
-            next(null, inserts);
-        });    
-    }
-}
-
-function insertVersionKeywords (inserts, next) {
-    if (inserts.versionKeywords.length) {
-        knex("version_keyword").insert(inserts.versionKeywords).exec(function (err, res) {
-            if (err) takeNote("version_keyword.insert()", inserts.package.package_name, err);
-            next(err, inserts);
-        });        
-    } else {
-        setImmediate(function () {
-            next(null, inserts);
-        });    
-    }
-}
-
-function insertVersionBins (inserts, next) {
-    if (inserts.versionBins.length) {
-        knex("version_bin").insert(inserts.versionBins).exec(function (err, res) {
-            if (err) takeNote("version_bin.insert()", inserts.package.package_name, err);
-            next(err, inserts);
-        });        
-    } else {
-        setImmediate(function () {
-            next(null, inserts);
-        });    
-    }
-}
-
-function insertVersionScripts (inserts, next) {
-    if (inserts.versionScripts.length) {
-        knex("version_script").insert(inserts.versionScripts).exec(function (err, res) {
-            if (err) takeNote("version_script.insert()", inserts.package.package_name, err);
-            next(err, inserts);
-        });        
-    } else {
-        setImmediate(function () {
-            next(null, inserts);
-        });    
     }
 }
