@@ -266,25 +266,27 @@ function persistToPg (change, cb) {
 
         // For each version, also do the other things...
         if (dv.contributors && dv.contributors.length && dv.contributors instanceof Array) {
-            dv.contributors.forEach(function (c) {
-                if (c && (c.name || c.email)) sqlInserts.versionContributors.push({
+            for (var c = 0; c < dv.contributors.length; c++) {
+                var contributor = dv.contributors[c];
+                if (contributor && (contributor.name || contributor.email)) sqlInserts.versionContributors.push({
                     package_name: doc._id,
                     version: v,
-                    name: c.name, 
-                    email: c.email
+                    name: contributor.name, 
+                    email: contributor.email
                 });    
-            });
+            }
         }
 
         if (dv.maintainers && dv.maintainers.length && dv.maintainers instanceof Array) {
-            dv.maintainers.forEach(function (m) {
-                if (m && (m.name || m.email)) sqlInserts.versionMaintainers.push({
-                    package_name: doc._id,
-                    version: v,
-                    name: m.name, 
-                    email: m.email
-                });    
-            });
+            for (var m = 0; m < dv.maintainers.length; m++) {
+                var maintainer = dv.maintainers[m];
+                if (maintainer && (maintainer.name || maintainer.email)) sqlInserts.versionMaintainers.push({
+                package_name: doc._id,
+                version: v,
+                name: maintainer.name, 
+                email: maintainer.email
+                });
+            }
         }
 
         if (dv.dependencies) {
@@ -310,13 +312,14 @@ function persistToPg (change, cb) {
         }
 
         if (dv.keywords && dv.keywords.length && dv.keywords instanceof Array) {
-            dv.keywords.forEach(function (k) {
-                if (k) sqlInserts.versionKeywords.push({
+            for (var k = 0; k < dv.keywords.length; k++) {
+                var keyword = dv.keywords[k];
+                if (keyword) sqlInserts.versionKeywords.push({
                     package_name: doc._id,
                     version: v,
-                    keyword: k
+                    keyword: keyword
                 });
-            });
+            }
         } else if (dv.keywords && dv.keywords.length && typeof dv.keywords === 'string') {
             // This is a string of 1 keyword (maybe these were supposed to be split out automatically?)
             sqlInserts.versionKeywords.push({
