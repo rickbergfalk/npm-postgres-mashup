@@ -1,3 +1,5 @@
-node_modules/
-.zedstate
-error-log.txt
+/node_modules
+/.zedstate
+/error-log.txt
+/test.js
+/test*.js
