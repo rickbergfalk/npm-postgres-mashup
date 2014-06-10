@@ -6,8 +6,6 @@ For when you want to replicate most<sup>[1](#1)</sup> of the npm skimdb registry
 
 ## Usage
 
-Assuming you have a postgres database available:
-
 ```js  
 var npmpm = require('npm-postgres-mashup');
 
@@ -44,6 +42,8 @@ npmpm.copyTheData({
 
 ```
 
+npm-postgres-mashup will automatically add the necessary tables to the postgres database. 
+
 
 
 ## Installation
@@ -56,7 +56,9 @@ npm install npm-postgres-mashup
 
 ## Why?
 
-This is a library for fun, and does not aim to recreate npm in Postgres. This is more of an experiment to answer those nagging question "What would npm look like if it were stored in a relational database?" or "How would it feel to work with npm if I had to deal with a relational model?"
+This is a library for fun, and does not aim to recreate npm in Postgres. This is more of an experiment to answer questions like "What would npm look like if it were stored in a relational database?" or "How would it feel to work with npm if I had to deal with a relational model?"
+
+Of course having npm in this kind of format makes for some interesting data analysis as well...
 
 
 
@@ -87,9 +89,9 @@ MIT
 
 Most of the registy is there, but not all. A handful of packages have invalid UTF8 encoding or something like that. They fail to insert and this doesn't try to address that.
 
-#### Some of the obscure package/version properties
+#### Some of the obscure package properties
 
-This module doesn't load all the properties for a given package/version. Most of the data is there though. If something is missing and you really want it, pull requests are welcome! 
+This module doesn't load all the properties for a given package version. Most of the data is there though. If something is missing and you really want it, pull requests are welcome! 
 
 #### An update to a package version (this should never happen)
 
