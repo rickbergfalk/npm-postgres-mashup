@@ -1,6 +1,6 @@
 # npm Postgres Mashup
 
-For when you want to replicate most<sup>[1](#1)</sup> of the npm skimdb registry to a *relational* model inside Postgres. **Now with continuous replication!**
+For when you want to replicate most<sup>[1](#1)</sup> of the npm skimdb registry to a *relational* model inside Postgres. **Now with continuous replication and more efficiency!**
 
 
 
@@ -17,11 +17,28 @@ npmpm.copyTheData({
     postgresDatabase: 'postgres-db-name',
     postgresUser: 'postgres-db-user',
     postgresPassword: 'postgres-db-password',
-    beNoisy: true,                            // if you want to be console.logged a lot
-    emptyPostgres: true,                      // removes any npm postgres tables and start fresh
-    stopOnCatchup: false,                     // exits process once caught up
-    onCatchup: function () {                  // fires once caught up
-        console.log('all caught up!');
+    
+    // Optional. Defaults to false
+    // Use if you want to be console.logged a lot and updated about progress
+    beNoisy: true,             
+    
+    // Optional. Defaults to false
+    // Use if you want to remove any npm postgres tables and start fresh
+    // Otherwise processing will pick up where you left off
+    emptyPostgres: true, 
+    
+    // fires once caught up
+    onCatchup: function () {
+        console.log("all caught up!");
+        console.log("turn me off now and start again later...");
+        console.log("or just let me keep going.");
+        
+        // use this to safetly stop processing the feed 
+        npmpm.stopFeedAndProcessing(function () {
+            console.log('stopped the feed');
+            console.log('exiting now');
+            process.exit(0);
+        });
     }
 });
 
@@ -78,4 +95,4 @@ This module doesn't load all the properties for a given package/version. Most of
 
 In npm, a version can only ever be published once, so we assume there is no need to save a package version a second time the next time a package change comes in.
 
-Due to the way couchdb works and the way npm (the company) is skimming the skimdb, once npm-postgres-mashup is caught up there will actually be 2 change documents per package version publish. The first change document presumably contains the binaries and fat that doesn't belong in the database. The skimdb daemon works to remove that fat and put it elsewhere, then updates the package with a fat-free version. This update causes the second change document, sometimes almost immediately after the first. 
+Due to the way couchdb works and the way npm (the company) is skimming the skimdb, once npm-postgres-mashup is caught up there will actually be 2 change documents per package version publish. The first change document presumably contains the binaries and fat that doesn't belong in the database. The skimdb daemon works to remove that fat and put it elsewhere, then updates the package with a fat-free version. This update causes the second change document, sometimes almost immediately after the first. Regarding the information we store in postgres, there should be no difference between the 1st and 2nd change events.

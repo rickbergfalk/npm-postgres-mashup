@@ -24,10 +24,26 @@ var onCatchup;
 
 var feed; // follow feed
 var startingSeq = 1;
-var parallelLimit = 10;
 var emptyPostgres = false;
 
-/*     Maybe Say
+var parallelLimit = 10;    // number of changes we'll process at once
+var changesProcessing = 0; // used to track number of changes that are currently processing
+
+
+/*  Manage Flow
+    stops/starts feed based on how many changes are currently being processed.
+============================================================================= */
+function manageFlow () {
+    if (changesProcessing >= parallelLimit && !feed.is_paused) {
+        // pause processing til we drop down below 10
+        feed.pause();
+    } else if (changesProcessing < parallelLimit && feed.is_paused) {
+        feed.resume();
+    }
+}
+
+
+/*  Maybe Say
     A function to maybe console.log something. It depends on if the user wants it or not
 ============================================================================= */
 function maybeSay (words) {
@@ -35,7 +51,7 @@ function maybeSay (words) {
 }
 
 
-/*     Take Note
+/*  Take Note
     A common way of noting any log type stuff. 
     Not that robust but it works and I abuse it sometimes for things other than errors.
     Even though this uses an async appendFile we aren't taking any callbacks because
@@ -52,9 +68,14 @@ function takeNote (doingWhat, package_name, error) {
 }
 
 
-exports.stopFeed = function () {
+/*  Stop Feed, available to end users. 
+============================================================================= */
+exports.stopFeedAndProcessing = function (cb) {
     if (feed) feed.stop();
-}
+    // TODO - check if anything is still processing. 
+    // Wait until that's done before calling callback.
+    if (cb) cb();
+};
 
 
 /*     Copy The Data function
@@ -72,8 +93,8 @@ exports.copyTheData = function (config) {
     postgresPassword = config.postgresPassword;
     if (config.logFile) logFile = config.logFile;
     if (config.beNoisy) beNoisy = true;
-    if (config.onCatchup) onCatchup = config.onCatchup;
     if (config.emptyPostgres) emptyPostgres = true;
+    if (config.onCatchup) onCatchup = config.onCatchup;
     
     // clear out the log file for this run
     fs.writeFileSync(logFile, "", {encoding: 'utf8'});
@@ -92,11 +113,13 @@ exports.copyTheData = function (config) {
 };
 
 
-/*     
-    Migrate the Postgres Database then do The Big Kickoff()
-    We need to prep the Postgres Database so its ready for our data
-    **Currently we're DROPPING ALL THE TABLES and recreating them.**
-    This will need to change if we do a continuous feed import someday
+/*  Gets the postgres database ready for the data.
+    It first migrates postgres up to the latest schemaversion if it isn't there already
+    Then it gets the latest sequence processed, in case we are resuming the feed
+    from a previous run.
+    If the end user decided to empty the database, postgres is migrated all the way down
+    and back up, which will drop and recreate tables and things.
+    Finally, the function to start following CouchDB is called.
 ============================================================================= */
 function initPostgres () {
     postgrator.config.set({
@@ -112,6 +135,9 @@ function initPostgres () {
             takeNote("Migrating up to 002", "", err);
             throw(err); // if we can't migrate, there is no use in continuing.
         }
+        // TODO: this sequence is not reliable as a resume point. 
+        // what happens if 1, 2, and 3 run. 3 finishes. process stops. 
+        // 1 and 2 never made it to DB. Should start at 1 not 3.
         knex('load_log').max('seq').exec(function (err, res) {
             if (err) maybeSay(err);
             if (res && res[0] && res[0].max && !emptyPostgres) {
@@ -137,19 +163,8 @@ function initPostgres () {
     });
 }
 
-var changesProcessing = 0;    
-function manageFlow () {
-    if (changesProcessing >= parallelLimit && !feed.is_paused) {
-        // pause processing til we drop down below 10
-        feed.pause();
-    } else if (changesProcessing < parallelLimit && feed.is_paused) {
-        feed.resume();
-    }
-}
 
-/*  The Big Kickoff
-    This gets all the changes from CouchDB starting at the beginning.
-    Once all the changes are gotten, we iterate over them
+/*  Starts following the CouchDB
 ============================================================================= */
 function followCouch () {
     maybeSay("starting on sequence " + startingSeq);
@@ -165,7 +180,7 @@ function followCouch () {
     feed.on('change', function (change) {
         changesProcessing++;
         manageFlow();
-        persistToPg(change, function () {
+        onChangeReceived(change, function () {
             changesProcessing--;
             manageFlow();
         });
@@ -196,354 +211,348 @@ function followCouch () {
 }
 
 
-/*  Persist to Postgres function.
-    This will be called for every change from couchdb. 
+/*  This will be called for every change from couchdb. 
     It takes the doc and transforms it for sql, the puts it to postgres
 ============================================================================= */
-function persistToPg (change, cb) {
+var insertCount = 0;
+var metricsBeginTime;
+var metricsEndTime;
+
+// keep track of what packages are being worked on at a time
+// this way we don't try editing the same package at the same time.
+// we could inspect the error thrown and ignore... but I'd rather avoid errors
+// if at all possible. 
+// wrapping things in a transactions, while safe and allows rollbacks, 
+// does not prevent errors entirely.
+var packagesProcessing = {}; 
+
+function onChangeReceived (change, cb) {
     changeCount++;
-    var doc = change.doc;
-    if (changeCount % 10 === 0) {
-        maybeSay("changeCount: " + changeCount);   
+    if (!metricsBeginTime) metricsBeginTime = new Date();
+    
+    // Every n changes we should log something interesting to look at.
+    // like change count and inserts per second, for fun
+    if (changeCount % 100 === 0) {
+        metricsEndTime = new Date();
+        var seconds = (metricsEndTime - metricsBeginTime) / 1000;
+        var insertsPerSecond = Math.round(insertCount / seconds);
+        maybeSay("changeCount: " + changeCount + "    insertsPerSecond: " + insertsPerSecond);
+        
+        // and then reset the data we accumulate
+        insertCount = 0;
+        metricsBeginTime = null;
+        metricsEndTime = null;
     }
-
-    var packageData = {};
-    var versionsData = [];
     
-    /* first assemble the package level info
-    -----------------------------------------------------------*/
-    packageData = {
-        package_name:         doc._id,
-        version_latest:     (doc["dist-tags"] ? doc["dist-tags"].latest : null),
-        version_rc:         (doc["dist-tags"] ? doc["dist-tags"].rc : null),
-        _rev:                 doc._rev,
-        readme:             doc.readme,
-        readme_filename:     doc.readmeFilename,
-        time_created:         (doc.time ? new Date(doc.time.created) : null),
-        time_modified:         (doc.time ? new Date(doc.time.modified) : null)
-    };
-
-    /* then for each version, assemble all the version level info
-    
-    {
-        package: {
-            package_name: "", 
-            version_latest: ""
-            etc
+    async.waterfall([
+        function initData (next){
+            var data = {doc: change.doc};
+            data.packageName = change.doc._id;
+            next(null, data);
         },
-        versions: [
-            {
-                tablename: "version_contributor",
-                package_name: "my-module",
-                version: "0.1.2",
-                rows: [{}, {}, {}]
-            }
-        ]
-        
-    }
-    -----------------------------------------------------------*/
-
-    for (var v in doc.versions) {
-        var dv = doc.versions[v];
-        var version = {
-            package_name:         doc._id,
-            version:             v,
-            description:         dv.description,
-            author_name:         (dv.author ? dv.author.name : null),
-            author_email:         (dv.author ? dv.author.email : null),
-            author_url:         (dv.author ? dv.author.url : null),
-            repository_type:     (dv.repository ? dv.repository.type : null),
-            repository_url:     (dv.repository ? dv.repository.url : null),
-            main:                 dv.main,
-            license:             dv.license,
-            homepage:             dv.homepage,
-            bugs_url:             (dv.bugs ? dv.bugs.url : null),
-            bugs_homepage:         (dv.bugs ? dv.bugs.homepage : null),
-            bugs_email:         (dv.bugs ? dv.bugs.email : null),
-            engine_node:         (dv.engines ? dv.engines.node : null),
-            engine_npm:         (dv.engines ? dv.engines.npm : null),
-            dist_shasum:         (dv.dist ? dv.dist.shasum : null),
-            dist_tarball:         (dv.dist ? dv.dist.tarball : null),
-            _from:                 dv._from,
-            _resolved:             dv._resolved,
-            _npm_version:         dv._npmVersion,
-            _npm_user_name:     (dv._npmUser ? dv._npmUser.name : null),
-            _npm_user_email:     (dv._npmUser ? dv._npmUser.email : null),
-            time_created:         (doc.time ? new Date(doc.time[v]) : null)
-        };
-        versionsData.push({
-            tablename: "version",
-            package_name: doc._id,
-            version: v,
-            rows: version
-        });
-
-        // For each version, also do the other things...
-        var versionContributors = [];
-        if (dv.contributors && dv.contributors.length && dv.contributors instanceof Array) {
-            for (var c = 0; c < dv.contributors.length; c++) {
-                var contributor = dv.contributors[c];
-                if (contributor && (contributor.name || contributor.email)) {
-                    versionContributors.push({
-                        package_name: doc._id,
-                        version: v,
-                        name: contributor.name, 
-                        email: contributor.email
-                    }); 
-                }
-            }
-        }
-        if (versionContributors.length) versionsData.push({
-            tablename: "version_contributor",
-            package_name: doc._id,
-            version: v,
-            rows: versionContributors
-        });
-        
-        // Version Maintainers
-        var versionMaintainers = [];
-        if (dv.maintainers && dv.maintainers.length && dv.maintainers instanceof Array) {
-            for (var m = 0; m < dv.maintainers.length; m++) {
-                var maintainer = dv.maintainers[m];
-                if (maintainer && (maintainer.name || maintainer.email)) versionMaintainers.push({
-                    package_name: doc._id,
-                    version: v,
-                    name: maintainer.name, 
-                    email: maintainer.email
-                });
-            }
-        }
-        if (versionMaintainers.length) versionsData.push({
-            tablename: "version_maintainer",
-            package_name: doc._id,
-            version: v,
-            rows: versionMaintainers
-        });
-        
-        
-        // Version Dependencies
-        var versionDependencies = [];
-        if (dv.dependencies) {
-            for (var d in dv.dependencies) {
-                versionDependencies.push({
-                    package_name: doc._id,
-                    version: v,
-                    dependency_name: d,
-                    dependency_version: dv.dependencies[d]
-                });
-            }
-        }
-        if (versionDependencies.length) versionsData.push({
-            tablename: "version_dependency",
-            package_name: doc._id,
-            version: v,
-            rows: versionDependencies
-        });
-        
-        // Version Dev Dependencies
-        var versionDevDependencies = [];
-        if (dv.devDependencies) {
-            for (var devdep in dv.devDependencies) {
-                versionDevDependencies.push({
-                    package_name: doc._id,
-                    version: v,
-                    dev_dependency_name: devdep,
-                    dev_dependency_version: dv.devDependencies[devdep]
-                });
-            }
-        }
-        if (versionDevDependencies.length) versionsData.push({
-            tablename: "version_dev_dependency",
-            package_name: doc._id,
-            version: v,
-            rows: versionDevDependencies
-        });
-        
-        // Version Keywords
-        var versionKeywords = [];
-        if (dv.keywords && dv.keywords.length && dv.keywords instanceof Array) {
-            for (var k = 0; k < dv.keywords.length; k++) {
-                var keyword = dv.keywords[k];
-                if (keyword) versionKeywords.push({
-                    package_name: doc._id,
-                    version: v,
-                    keyword: keyword
-                });
-            }
-        } else if (dv.keywords && dv.keywords.length && typeof dv.keywords === 'string') {
-            // This is a string of 1 keyword (maybe these were supposed to be split out automatically?)
-            versionKeywords.push({
-                package_name: doc._id,
-                version: v,
-                keyword: dv.keywords
-            });
-        }
-        if (versionKeywords.length) versionsData.push({
-            tablename: "version_keyword",
-            package_name: doc._id,
-            version: v,
-            rows: versionKeywords
-        });
-        
-        // Version Bin
-        var versionBins = [];
-        if (dv.bin) {
-            for (var b in dv.bin) {
-                versionBins.push({
-                    package_name: doc._id,
-                    version: v,
-                    bin_command: b, 
-                    bin_file: dv.bin[b]
-                });
-            }
-        }
-        if (versionBins.length) versionsData.push({
-            tablename: "version_bin",
-            package_name: doc._id,
-            version: v,
-            rows: versionBins
-        });
-        
-        
-        // Version Scripts
-        var versionScripts = [];
-        if (dv.scripts) {
-            for (var s in dv.scripts) {
-                versionScripts.push({
-                    package_name: doc._id,
-                    version: v,
-                    script_name: s,
-                    script_text: dv.scripts[s]
-                });
-            }
-        }
-        if (versionScripts.length) versionsData.push({
-            tablename: "version_script",
-            package_name: doc._id,
-            version: v,
-            rows: versionScripts
-        });
-    }
-
-    /*  Persist this stuff to Postgres
-        
-        This runs a bunch of functions designed for waterfall flow.
-        I really like node.js, but sometimes stuff like this takes a lot of effort 
-        to think through and write out in an elegant way. 
-        (And I'm assuming/hoping this is considered elegant - that could be a stretch)
-        
-        Also, note that the first function is being added 
-        to bootstrap the waterfall with the sqlInserts data.
-        Is there not a way to start an async.waterfall with some data?
-        
-        
-        
-    -----------------------------------------------------------*/
-    
-    function packageToPg (tran, pkg, callback) {
-        knex("package")
-            .transacting(tran)
-            .select("package_name")
-            .where("package_name", pkg.package_name)
-            .exec(function (err, res) {
-                if (err) {
-                    callback(err);
+        function throttleByPackageName (data, next) {
+            // If we are not yet working on a change for this package continue
+            // otherwise, wait a second and check again.
+            function continueIfOpen () {
+                if (!packagesProcessing.hasOwnProperty(data.packageName)) {
+                    packagesProcessing[data.packageName] = data.packageName;
+                    next(null, data);
                 } else {
-                   if (res && res.length) {
-                       // package found. gonna update
-                       knex("package").transacting(tran).where("package_name", pkg.package_name).update(pkg).exec(callback);
-                   } else {
-                       // no package found, gonna insert
-                       knex("package").transacting(tran).insert(pkg).exec(callback);
-                   } 
+                    maybeSay("already processing a change for " + data.packageName + ". waiting a sec...");
+                    setTimeout(continueIfOpen, 10000);
                 }
+            }
+            continueIfOpen();
+        },
+        function assemblePackageLevelInfo (data, next){
+            var doc = data.doc;
+            data.packageData = {
+                package_name:      doc._id,
+                version_latest:    (doc["dist-tags"] ? doc["dist-tags"].latest : null),
+                version_rc:        (doc["dist-tags"] ? doc["dist-tags"].rc : null),
+                _rev:              doc._rev,
+                readme:            doc.readme,
+                readme_filename:   doc.readmeFilename,
+                time_created:      (doc.time ? new Date(doc.time.created) : null),
+                time_modified:     (doc.time ? new Date(doc.time.modified) : null)
+            };
+            next(null, data);
+        },
+        function getAllVersionsForPackageFromDb (data, next) {
+            data.versionsInDb = {};
+            knex("version")
+                .select("version")
+                .where("package_name", data.packageData.package_name)
+                .exec(function (err, res) {
+                    if (err) {
+                        next(err);
+                    } else {
+                       if (res && res.length) {
+                           for (var record = 0; record < res.length; record++) {
+                               var version = res[record].version;
+                               data.versionsInDb[version] = version;
+                           }
+                       }
+                       next(null, data);
+                    }
+                });
+        },
+        function assembleVersionData (data, next) {
+            var doc = data.doc;
+            data.inserts = {};
+            data.inserts.version = [];
+            data.inserts.version_contributor = [];
+            data.inserts.version_maintainer = [];
+            data.inserts.version_dependency = [];
+            data.inserts.version_dev_dependency = [];
+            data.inserts.version_keyword = [];
+            data.inserts.version_bin = [];
+            data.inserts.version_script = [];
+            
+            for (var v in doc.versions) {
+                // if version is not in database...
+                if (!data.versionsInDb[v]) {
+                    var dv = doc.versions[v];
+                    var version = {
+                        package_name:     doc._id,
+                        version:          v,
+                        description:      dv.description,
+                        author_name:      (dv.author ? dv.author.name : null),
+                        author_email:     (dv.author ? dv.author.email : null),
+                        author_url:       (dv.author ? dv.author.url : null),
+                        repository_type:  (dv.repository ? dv.repository.type : null),
+                        repository_url:   (dv.repository ? dv.repository.url : null),
+                        main:             dv.main,
+                        license:          dv.license,
+                        homepage:         dv.homepage,
+                        bugs_url:         (dv.bugs ? dv.bugs.url : null),
+                        bugs_homepage:    (dv.bugs ? dv.bugs.homepage : null),
+                        bugs_email:       (dv.bugs ? dv.bugs.email : null),
+                        engine_node:      (dv.engines ? dv.engines.node : null),
+                        engine_npm:       (dv.engines ? dv.engines.npm : null),
+                        dist_shasum:      (dv.dist ? dv.dist.shasum : null),
+                        dist_tarball:     (dv.dist ? dv.dist.tarball : null),
+                        _from:            dv._from,
+                        _resolved:        dv._resolved,
+                        _npm_version:     dv._npmVersion,
+                        _npm_user_name:   (dv._npmUser ? dv._npmUser.name : null),
+                        _npm_user_email:  (dv._npmUser ? dv._npmUser.email : null),
+                        time_created:     (doc.time ? new Date(doc.time[v]) : null)
+                    };
+                    data.inserts.version.push(version);
+                    
+                    // Version Contributor
+                    if (dv.contributors && dv.contributors.length && dv.contributors instanceof Array) {
+                        for (var c = 0; c < dv.contributors.length; c++) {
+                            var contributor = dv.contributors[c];
+                            if (contributor && (contributor.name || contributor.email)) {
+                                data.inserts.version_contributor.push({
+                                    package_name: doc._id,
+                                    version: v,
+                                    name: contributor.name, 
+                                    email: contributor.email
+                                }); 
+                            }
+                        }
+                    }
+                    
+                    // Version Maintainers
+                    if (dv.maintainers && dv.maintainers.length && dv.maintainers instanceof Array) {
+                        for (var m = 0; m < dv.maintainers.length; m++) {
+                            var maintainer = dv.maintainers[m];
+                            if (maintainer && (maintainer.name || maintainer.email)) {
+                                data.inserts.version_maintainer.push({
+                                    package_name: doc._id,
+                                    version: v,
+                                    name: maintainer.name, 
+                                    email: maintainer.email
+                                });
+                            }
+                        }
+                    }
+                    
+                    // Version Dependencies
+                    if (dv.dependencies) {
+                        for (var d in dv.dependencies) {
+                            data.inserts.version_dependency.push({
+                                package_name: doc._id,
+                                version: v,
+                                dependency_name: d,
+                                dependency_version: dv.dependencies[d]
+                            });
+                        }
+                    }
+                    
+                    // Version Dev Dependencies
+                    if (dv.devDependencies) {
+                        for (var devdep in dv.devDependencies) {
+                            data.inserts.version_dev_dependency.push({
+                                package_name: doc._id,
+                                version: v,
+                                dev_dependency_name: devdep,
+                                dev_dependency_version: dv.devDependencies[devdep]
+                            });
+                        }
+                    }
+                    
+                    // Version Keywords
+                    if (dv.keywords && dv.keywords.length && dv.keywords instanceof Array) {
+                        for (var k = 0; k < dv.keywords.length; k++) {
+                            var keyword = dv.keywords[k];
+                            if (keyword) data.inserts.version_keyword.push({
+                                package_name: doc._id,
+                                version: v,
+                                keyword: keyword
+                            });
+                        }
+                    } else if (dv.keywords && dv.keywords.length && typeof dv.keywords === 'string') {
+                        // This is a string of 1 keyword (maybe these were supposed to be split out automatically?)
+                        data.inserts.version_keyword.push({
+                            package_name: doc._id,
+                            version: v,
+                            keyword: dv.keywords
+                        });
+                    }
+                    
+                    // Version Bin
+                    if (dv.bin) {
+                        for (var b in dv.bin) {
+                            data.inserts.version_bin.push({
+                                package_name: doc._id,
+                                version: v,
+                                bin_command: b, 
+                                bin_file: dv.bin[b]
+                            });
+                        }
+                    }
+                    
+                    // Version Scripts
+                    if (dv.scripts) {
+                        for (var s in dv.scripts) {
+                            data.inserts.version_script.push({
+                                package_name: doc._id,
+                                version: v,
+                                script_name: s,
+                                script_text: dv.scripts[s]
+                            });
+                        }
+                    }
+                    
+                } // end if version not in database;
+            } // end for loop iterating over versions in the doc
+            
+            next(null, data);
+            
+        }, // end function assembleVersionData
+        function beginTransaction (data, next) {
+            data.inserts_start = new Date();
+            data.inserts_finish = null;
+            knex.transaction(function(t) {
+                data.tran = t;
+                next(null, data);
+            }).then(function(resp) {
+                //console.log('Transaction complete.');
+            }).catch(function(err) {
+                console.log("rolled back " + data.packageData.package_name);
+                //console.error(err);
             });
-    }
+        }, 
+        function updateOrInsertPackage (data, next) {
+            var tran = data.tran;
+            var pkg = data.packageData;
+            knex("package")
+                .transacting(tran)
+                .select("package_name")
+                .where("package_name", pkg.package_name)
+                .exec(function (err, res) {
+                    if (err) {
+                        next(err, data);
+                    } else {
+                       if (res && res.length) {
+                           // package found. gonna update
+                           knex("package").transacting(tran).where("package_name", pkg.package_name).update(pkg).exec(function (err) {
+                               if (err) next(err, data);
+                               else next(null, data);
+                           });
+                       } else {
+                           // no package found, gonna insert
+                           knex("package").transacting(tran).insert(pkg).exec(function(err) {
+                               if (err) next(err, data);
+                               else next(null, data);
+                           });
+                       } 
+                    }
+                });
+        },
+        function doVersionInserts (data, next) {
+            
+            var versionsData = [];
+            for (var tablename in data.inserts) {
+                versionsData.push({
+                    tablename: tablename,
+                    tran: data.tran,
+                    rows: data.inserts[tablename]
+                });
+            }
+            
+            async.eachSeries(versionsData, versionToPg, function (err) {
+                data.inserts_finish = new Date();
+                
+                // log to postgres
+                // it doesn't need to prevent the rest of the process from continuing
+                var load_log = {
+                    seq: change.seq,
+                    package_name: data.packageData.package_name,
+                    version_latest: data.packageData.version_latest,
+                    inserts_start: data.inserts_start,
+                    inserts_finish: data.inserts_finish
+                };
+                knex("load_log").insert(load_log).exec(function (err) {
+                    if (err) {
+                        maybeSay("Couldn't log load activity in load_log. See error log for details.");
+                        takeNote("load_log.insert()", data.packageData.package_name, err);
+                    }
+                });
+                
+                next(err, data);
+            });
+        }
+    ], function theEndOfProcessingAChange (err, data) {
+        if (err) {
+            takeNote("versions import (unsure where)", data.packageData.package_name, err);
+            maybeSay("An insert failed somewhere - check log for details");
+            maybeSay("rolling back");
+            if (data.tran) data.tran.rollback();
+            errorCount++;
+            if (errorCount < errorLimit) {
+                cb();
+            } else {
+                console.log("Too many errors! Stopping this thing.");
+                feed.stop();
+                process.exit();
+            }
+        } else {
+            if (data.tran) data.tran.commit('');
+            cb();
+        }
+        // record that we are no longer processing a change for this package
+        if (packagesProcessing[data.packageName]) delete packagesProcessing[data.packageName];
+    });
     
-    function versionToPg (tableInfo, callback) {
-        // check if data already exists for package_name and version.
-        // if so, move on
-        // otherwise, insert data
+} // end  onChangeReceived
+
+
+/*  the function used to do the version inserts by async.eachSeries
+============================================================================= */
+function versionToPg (tableInfo, callback) {
+    if (tableInfo.rows && tableInfo.rows.length) {
+        insertCount = insertCount + tableInfo.rows.length;
         knex(tableInfo.tablename)
             .transacting(tableInfo.tran)
-            .select("package_name")
-            .where({"package_name": tableInfo.package_name, "version": tableInfo.version})
-            .exec(function (err, res) {
-                if (err) {
-                    callback(err);
-                } else {
-                    if (res && res.length) {
-                        // data found for package version. skip doing anything else
-                        callback();
-                    } else {
-                        // no data found for that package version. insert
-                        knex(tableInfo.tablename)
-                            .transacting(tableInfo.tran)
-                            .insert(tableInfo.rows)
-                            .exec(callback);
-                    }
-                }
-            });
+            .insert(tableInfo.rows)
+            .exec(callback);
+    } else {
+        // move on to the next one, nothing to insert here
+        callback(); 
     }
-    
-    var inserts_start = new Date();
-    var inserts_finish;
-    knex.transaction(function(t) {
-        
-        // bootstrap transaction onto each version table set
-        versionsData.forEach(function(version) {
-            version.tran = t;
-        });
-        
-        packageToPg(t, packageData, function (err) {
-            if (err) {
-                takeNote("package import", packageData.package_name, err);
-                
-            } else {
-                async.eachSeries(versionsData, versionToPg, function (err) {
-                    inserts_finish = new Date();
-                    
-                    // log to postgres
-                    // it doesn't need to prevent the rest of the process from continuing
-                    var load_log = {
-                        seq: change.seq,
-                        package_name: packageData.package_name,
-                        version_latest: packageData.version_latest,
-                        inserts_start: inserts_start,
-                        inserts_finish: inserts_finish
-                    };
-                    knex("load_log").insert(load_log).exec(function (err) {
-                        if (err) {
-                            maybeSay("Couldn't log load activity in load_log. See error log for details.");
-                            takeNote("load_log.insert()", packageData.package_name, err);
-                        }
-                    });
-                    
-                    if (err) {
-                        takeNote("versions import (unsure where)", packageData.package_name, err);
-                        maybeSay("An insert failed somewhere - check log for details");
-                        maybeSay("rolling back");
-                        t.rollback();
-                        errorCount++;
-                        if (errorCount < errorLimit) {
-                            cb();
-                        } else {
-                            console.log("Too many errors! Stopping this thing.");
-                            process.exit();
-                        }
-                    } else {
-                        t.commit('');
-                        cb();
-                    }
-                })
-            }
-        });
-       
-    }).then(function () {
-        // it was committed? 
-        // Normally we'd continue here, but I'm not using the promises api so that's happening somewhere else
-        // promise-flow is messing with my callback flow :(
-    }, function (err) {
-        maybeSay('rolled back: ' + (err || '')); 
-    });
 }
