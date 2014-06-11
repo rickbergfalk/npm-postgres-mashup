@@ -22,6 +22,8 @@ var beNoisy = false;              // if set to true we'll console.log progress
 var logFile = __dirname + "/error-log.txt";
 var onCatchup;
 
+var schemaversion = '004';
+
 var feed; // follow feed
 var startingSeq = 1;
 var emptyPostgres = false;
@@ -69,12 +71,24 @@ function takeNote (doingWhat, package_name, error) {
 
 
 /*  Stop Feed, available to end users. 
+    loops every second, checking to see if changes are still being
+    persisted to Postgres. If changes processing reaches 0, or 60+ attempts have
+    been made, we call the callback.
 ============================================================================= */
 exports.stopFeedAndProcessing = function (cb) {
-    if (feed) feed.stop();
-    // TODO - check if anything is still processing. 
-    // Wait until that's done before calling callback.
-    if (cb) cb();
+    if (feed) {
+        feed.stop();
+    }
+    var attempts = 0;
+    function loopUntilFinished () {
+        if (changesProcessing === 0 || attempts > 60) {
+            cb();
+        } else {
+            attempts++;
+            setTimeout(loopUntilFinished, 1000);
+        }
+    }
+    loopUntilFinished();
 };
 
 
@@ -130,39 +144,59 @@ function initPostgres () {
         username: postgresUser,
         password: postgresPassword
     });
-    postgrator.migrate('002', function (err) {
+    postgrator.migrate(schemaversion, function (err) {
         if (err) {
-            takeNote("Migrating up to 002", "", err);
+            takeNote("Migrating up to " + schemaversion, "", err);
             throw(err); // if we can't migrate, there is no use in continuing.
         }
-        // TODO: this sequence is not reliable as a resume point. 
-        // what happens if 1, 2, and 3 run. 3 finishes. process stops. 
-        // 1 and 2 never made it to DB. Should start at 1 not 3.
-        knex('load_log').max('seq').exec(function (err, res) {
-            if (err) maybeSay(err);
-            if (res && res[0] && res[0].max && !emptyPostgres) {
-                startingSeq = res[0].max;
-                followCouch();
-            } else {
-                maybeSay("Either max seq is not present, or user opted to empty postgres");
-                postgrator.migrate('000', function (err) {
-                    if (err) { 
-                        takeNote("Migrating down to 000", "", err);
-                        throw(err); // if we can't migrate there is no use going forward
-                    }
-                    postgrator.migrate('002', function (err) {
-                        if (err) {
-                            takeNote("Migrating up to 002", "", err);
-                            throw(err);
-                        }
-                        followCouch();
-                    });
-                });
-            }
-        });
+        figureOutWhereWeLeftOff();
     });
 }
 
+function figureOutWhereWeLeftOff () {
+    // TODO: this sequence is not reliable as a resume point. 
+    // what happens if 1, 2, and 3 run. 3 finishes. process stops. 
+    // 1 and 2 never made it to DB. Should start at 1 not 3.
+    knex('load_log').min('seq').where("processing", 1).exec(function (err, res) {
+        if (err) maybeSay(err);
+        if (res && res[0] && res[0].min) {
+            startingSeq = res[0].min;
+            maybeEmptyPostgres();
+        } else {
+            knex('load_log').max('seq').exec(function (err, res) {
+                if (err) maybeSay(err);
+                if (res && res[0] && res[0].max) {
+                    startingSeq = res[0].max;
+                }
+                maybeEmptyPostgres();
+            });
+        }
+    });
+    
+}
+
+function maybeEmptyPostgres () {
+    
+    if (startingSeq === 1 || emptyPostgres) {
+        if (startingSeq > 1) startingSeq = 1;
+        maybeSay("Either sequence history is not available, or you opted to empty postgres");
+        postgrator.migrate('000', function (err) {
+            if (err) { 
+                takeNote("Migrating down to 000", "", err);
+                throw(err); // if we can't migrate there is no use going forward
+            }
+            postgrator.migrate(schemaversion, function (err) {
+                if (err) {
+                    takeNote("Migrating up to " + schemaversion, "", err);
+                    throw(err);
+                }
+                followCouch();
+            });
+        });
+    } else {
+        followCouch();
+    }
+}
 
 /*  Starts following the CouchDB
 ============================================================================= */
@@ -246,8 +280,11 @@ function onChangeReceived (change, cb) {
     
     async.waterfall([
         function initData (next){
-            var data = {doc: change.doc};
-            data.packageName = change.doc._id;
+            var data = {
+                doc: change.doc, 
+                seq: change.seq,
+                packageName: change.doc._id
+            };
             next(null, data);
         },
         function throttleByPackageName (data, next) {
@@ -263,6 +300,35 @@ function onChangeReceived (change, cb) {
                 }
             }
             continueIfOpen();
+        },
+        function startLoadLog (data, next) {
+            data.inserts_start = new Date();
+            data.inserts_finish = null;
+            // NOTE: the load log stuff should happen outside the transaction.
+            // we don't want this getting rolled back.
+            var loadLog = {
+                seq: data.seq,
+                package_name: data.packageName,
+                inserts_start: data.inserts_start,
+                processing: 1
+            };
+            knex("load_log").select("seq").where("seq", data.seq).exec(function (err, res) {
+                if (err) {
+                    next(err, data);
+                } else {
+                    if (res && res.length) {
+                        // do an update
+                        knex("load_log").where("seq", data.seq).update(loadLog).exec(function (err, res) {
+                            next(err, data);
+                        });
+                    } else {
+                        // do an insert
+                        knex("load_log").insert(loadLog).exec(function (err, res) {
+                            next(err, data);
+                        });
+                    }
+                }
+            });
         },
         function assemblePackageLevelInfo (data, next){
             var doc = data.doc;
@@ -445,8 +511,7 @@ function onChangeReceived (change, cb) {
             
         }, // end function assembleVersionData
         function beginTransaction (data, next) {
-            data.inserts_start = new Date();
-            data.inserts_finish = null;
+            
             knex.transaction(function(t) {
                 data.tran = t;
                 next(null, data);
@@ -485,7 +550,6 @@ function onChangeReceived (change, cb) {
                 });
         },
         function doVersionInserts (data, next) {
-            
             var versionsData = [];
             for (var tablename in data.inserts) {
                 versionsData.push({
@@ -494,32 +558,31 @@ function onChangeReceived (change, cb) {
                     rows: data.inserts[tablename]
                 });
             }
-            
             async.eachSeries(versionsData, versionToPg, function (err) {
-                data.inserts_finish = new Date();
-                
-                // log to postgres
-                // it doesn't need to prevent the rest of the process from continuing
-                var load_log = {
-                    seq: change.seq,
-                    package_name: data.packageData.package_name,
-                    version_latest: data.packageData.version_latest,
-                    inserts_start: data.inserts_start,
-                    inserts_finish: data.inserts_finish
-                };
-                knex("load_log").insert(load_log).exec(function (err) {
-                    if (err) {
-                        maybeSay("Couldn't log load activity in load_log. See error log for details.");
-                        takeNote("load_log.insert()", data.packageData.package_name, err);
-                    }
-                });
-                
                 next(err, data);
             });
         }
     ], function theEndOfProcessingAChange (err, data) {
+        data.inserts_finish = new Date();
+        // Update the inserts_finish time, as well as change the processing bit to false.
+        // This needs to happen regardless of error or not. 
+        var loadLog = {
+            seq: data.seq,
+            package_name: data.packageName,
+            version_latest: data.packageData.version_latest,
+            inserts_start: data.inserts_start,
+            inserts_finish: data.inserts_finish,
+            processing: 0
+        };
+        knex("load_log").where("seq", data.seq).update(loadLog).exec(function (err, res) {
+            if (err) {
+                takeNote("Error Finalizing load_log", data.packageName, err);
+                maybeSay("Error Finalizing load_log for package " + data.packageName);
+            }
+        });
+        
         if (err) {
-            takeNote("versions import (unsure where)", data.packageData.package_name, err);
+            takeNote("versions import (unsure where)", data.packageName, err);
             maybeSay("An insert failed somewhere - check log for details");
             maybeSay("rolling back");
             if (data.tran) data.tran.rollback();
