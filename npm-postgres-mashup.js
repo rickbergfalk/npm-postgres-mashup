@@ -6,7 +6,7 @@ var follow = require('follow');
 var knex = require('knex');
 var async = require('async');
 var postgrator = require('postgrator');
-
+var getVersionParts = require('./lib/get-version-parts.js');
 
 /*     Variables for Later
 ============================================================================= */
@@ -22,7 +22,7 @@ var beNoisy = false;              // if set to true we'll console.log progress
 var logFile = __dirname + "/error-log.txt";
 var onCatchup;
 
-var schemaversion = '004';
+var schemaversion = '010';
 
 var feed; // follow feed
 var startingSeq = 1;
@@ -97,7 +97,7 @@ exports.stopFeedAndProcessing = function (cb) {
 ============================================================================= */
 exports.copyTheData = function (config) {
     if (!config.couchUrl) {
-        console.log('Please review the documentation as npm-postgre-mashup has changed.');
+        console.log('Please review the documentation as npm-postgres-mashup has changed.');
         process.exit();
     }
     couchUrl         = config.couchUrl;
@@ -154,13 +154,11 @@ function initPostgres () {
 }
 
 function figureOutWhereWeLeftOff () {
-    // TODO: this sequence is not reliable as a resume point. 
-    // what happens if 1, 2, and 3 run. 3 finishes. process stops. 
-    // 1 and 2 never made it to DB. Should start at 1 not 3.
     knex('load_log').min('seq').where("processing", 1).exec(function (err, res) {
         if (err) maybeSay(err);
         if (res && res[0] && res[0].min) {
-            startingSeq = res[0].min;
+            startingSeq = res[0].min - 1;
+            maybeSay("starting at sequence: " + startingSeq);
             maybeEmptyPostgres();
         } else {
             knex('load_log').max('seq').exec(function (err, res) {
@@ -168,6 +166,7 @@ function figureOutWhereWeLeftOff () {
                 if (res && res[0] && res[0].max) {
                     startingSeq = res[0].max;
                 }
+                maybeSay("starting at sequence: " + startingSeq);
                 maybeEmptyPostgres();
             });
         }
@@ -379,31 +378,37 @@ function onChangeReceived (change, cb) {
                 // if version is not in database...
                 if (!data.versionsInDb[v]) {
                     var dv = doc.versions[v];
+                    var versionParts = getVersionParts(v);
                     var version = {
-                        package_name:     doc._id,
-                        version:          v,
-                        description:      dv.description,
-                        author_name:      (dv.author ? dv.author.name : null),
-                        author_email:     (dv.author ? dv.author.email : null),
-                        author_url:       (dv.author ? dv.author.url : null),
-                        repository_type:  (dv.repository ? dv.repository.type : null),
-                        repository_url:   (dv.repository ? dv.repository.url : null),
-                        main:             dv.main,
-                        license:          dv.license,
-                        homepage:         dv.homepage,
-                        bugs_url:         (dv.bugs ? dv.bugs.url : null),
-                        bugs_homepage:    (dv.bugs ? dv.bugs.homepage : null),
-                        bugs_email:       (dv.bugs ? dv.bugs.email : null),
-                        engine_node:      (dv.engines ? dv.engines.node : null),
-                        engine_npm:       (dv.engines ? dv.engines.npm : null),
-                        dist_shasum:      (dv.dist ? dv.dist.shasum : null),
-                        dist_tarball:     (dv.dist ? dv.dist.tarball : null),
-                        _from:            dv._from,
-                        _resolved:        dv._resolved,
-                        _npm_version:     dv._npmVersion,
-                        _npm_user_name:   (dv._npmUser ? dv._npmUser.name : null),
-                        _npm_user_email:  (dv._npmUser ? dv._npmUser.email : null),
-                        time_created:     (doc.time ? new Date(doc.time[v]) : null)
+                        package_name:        doc._id,
+                        version:             v,
+                        description:         dv.description,
+                        author_name:         (dv.author ? dv.author.name : null),
+                        author_email:        (dv.author ? dv.author.email : null),
+                        author_url:          (dv.author ? dv.author.url : null),
+                        repository_type:     (dv.repository ? dv.repository.type : null),
+                        repository_url:      (dv.repository ? dv.repository.url : null),
+                        main:                dv.main,
+                        license:             dv.license,
+                        homepage:            dv.homepage,
+                        bugs_url:            (dv.bugs ? dv.bugs.url : null),
+                        bugs_homepage:       (dv.bugs ? dv.bugs.homepage : null),
+                        bugs_email:          (dv.bugs ? dv.bugs.email : null),
+                        engine_node:         (dv.engines ? dv.engines.node : null),
+                        engine_npm:          (dv.engines ? dv.engines.npm : null),
+                        dist_shasum:         (dv.dist ? dv.dist.shasum : null),
+                        dist_tarball:        (dv.dist ? dv.dist.tarball : null),
+                        _from:               dv._from,
+                        _resolved:           dv._resolved,
+                        _npm_version:        dv._npmVersion,
+                        _npm_user_name:      (dv._npmUser ? dv._npmUser.name : null),
+                        _npm_user_email:     (dv._npmUser ? dv._npmUser.email : null),
+                        time_created:        (doc.time ? new Date(doc.time[v]) : null),
+                        version_patch:       versionParts.patch,
+                        version_major:       versionParts.major,
+                        version_minor:       versionParts.minor,
+                        version_label:       versionParts.label,
+                        version_is_stable:   (versionParts.isStable ? 1 : 0)
                     };
                     data.inserts.version.push(version);
                     
@@ -560,6 +565,12 @@ function onChangeReceived (change, cb) {
             }
             async.eachSeries(versionsData, versionToPg, function (err) {
                 next(err, data);
+            });
+        },
+        function doPreviousStableUpdate (data, next) {
+            knex.raw("select update_previous_versions(?)", [data.packageData.package_name]).exec(function(err) {
+                if (err) next(err, data);
+                else next(null, data);
             });
         }
     ], function theEndOfProcessingAChange (err, data) {
