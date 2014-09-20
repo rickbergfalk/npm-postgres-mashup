@@ -38,8 +38,10 @@ var changesProcessing = 0; // used to track number of changes that are currently
 function manageFlow () {
     if (changesProcessing >= parallelLimit && !feed.is_paused) {
         // pause processing til we drop down below 10
+        //maybeSay("pausing. Changes processing: " + changesProcessing);
         feed.pause();
     } else if (changesProcessing < parallelLimit && feed.is_paused) {
+        //maybeSay("resuming. Changes processing: " + changesProcessing);
         feed.resume();
     }
 }
@@ -566,13 +568,17 @@ function onChangeReceived (change, cb) {
             async.eachSeries(versionsData, versionToPg, function (err) {
                 next(err, data);
             });
-        },
+        }
+        /*
+        ,
         function doPreviousStableUpdate (data, next) {
             knex.raw("select update_previous_versions(?)", [data.packageData.package_name]).exec(function(err) {
                 if (err) next(err, data);
                 else next(null, data);
             });
+            
         }
+        */
     ], function theEndOfProcessingAChange (err, data) {
         data.inserts_finish = new Date();
         // Update the inserts_finish time, as well as change the processing bit to false.
