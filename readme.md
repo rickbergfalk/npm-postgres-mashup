@@ -1,10 +1,33 @@
 # npm Postgres Mashup
 
-For when you want to replicate most<sup>[1](#1)</sup> of the npm skimdb registry to a *relational* model inside Postgres. **Now with continuous replication and more efficiency!**
+For when you want to replicate most<sup>[1](#1)</sup> of the npm skimdb registry to a *relational* model inside Postgres. **Now as a cli app**
 
 
 
 ## Usage
+
+### As a CLI app
+The best way to use npm-postgres-mashup is to install it as a cli app:
+
+```
+npm install npm-postgres-mashup -g
+```
+
+This installs the cli tool "npm2pg". Next create an empty Postgres database and then follow the 
+
+```
+npm2pg --help
+```
+
+
+
+### As a regular node.js module
+
+To be honest, the npm-postgres-mashup api is not as advanced as it should be to be used in this way. However, it is still an option if you'd like to use it.
+
+```
+npm install npm-postgres-mashup
+```
 
 ```js  
 var npmpm = require('npm-postgres-mashup');
@@ -44,13 +67,6 @@ npmpm.copyTheData({
 
 npm-postgres-mashup will automatically add the necessary tables to the postgres database. 
 
-
-
-## Installation
-
-```
-npm install npm-postgres-mashup
-```
 
 
 

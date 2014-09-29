@@ -3,10 +3,15 @@
 
 var fs = require('fs');
 var follow = require('follow');
-var knex = require('knex');
 var async = require('async');
 var postgrator = require('postgrator');
 var getVersionParts = require('./lib/get-version-parts.js');
+var select = require('sql-bricks').select;
+var insert = require('sql-bricks').insert;
+var update = require('sql-bricks').update;
+var pg = require('pg.js');
+var conString = "";
+
 
 /*     Variables for Later
 ============================================================================= */
@@ -20,6 +25,7 @@ var postgresPassword;
 var postgresDatabase;
 var beNoisy = false;              // if set to true we'll console.log progress
 var logFile = __dirname + "/error-log.txt";
+var fixFile = __dirname + "/fix-log.txt";
 var onCatchup;
 
 var schemaversion = '010';
@@ -28,7 +34,7 @@ var feed; // follow feed
 var startingSeq = 1;
 var emptyPostgres = false;
 
-var parallelLimit = 10;    // number of changes we'll process at once
+var parallelLimit = 8;    // number of changes we'll process at once
 var changesProcessing = 0; // used to track number of changes that are currently processing
 
 
@@ -52,6 +58,19 @@ function manageFlow () {
 ============================================================================= */
 function maybeSay (words) {
     if (beNoisy) console.log(words);
+}
+
+function ensureString (thing, field) {
+    if (typeof thing === "string") {
+        return thing;
+    } else if (typeof thing === "undefined") {
+        return null;
+    } else if (thing === null) {
+        return null;
+    } else {
+        var text = "\n\n" + field + "\n" + JSON.stringify(thing, null, 2);
+        return JSON.stringify(thing, null, 2);
+    }
 }
 
 
@@ -94,6 +113,22 @@ exports.stopFeedAndProcessing = function (cb) {
 };
 
 
+/*  Allow the end user to stop the process safely 
+============================================================================= */
+process.stdin.resume();
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', function (data) {
+    data = (data + '').trim().toLowerCase();
+    if (data === 'stop') {
+        console.log('stopping. please hold.');
+        exports.stopFeedAndProcessing(function () {
+            console.log('Changes have stopped processing.');
+            process.exit();
+        });
+    }
+});
+
+
 /*     Copy The Data function
     This one starts the process, and is really the only thing available to end users
 ============================================================================= */
@@ -112,18 +147,12 @@ exports.copyTheData = function (config) {
     if (config.emptyPostgres) emptyPostgres = true;
     if (config.onCatchup) onCatchup = config.onCatchup;
     
-    // clear out the log file for this run
+    // clear out the log/fix file for this run
     fs.writeFileSync(logFile, "", {encoding: 'utf8'});
-
-    knex = knex.initialize({
-        client: 'pg',
-        connection: {
-            host: postgresHost,
-            database: postgresDatabase,
-            user: postgresUser,
-            password: postgresPassword
-        }
-    });
+    fs.writeFileSync(fixFile, "", {encoding: 'utf8'});
+    
+    conString = "tcp://" + postgresUser + ":" + postgresPassword + "@" + postgresHost + "/" + postgresDatabase;
+    console.log(conString);
     
     initPostgres();                
 };
@@ -156,24 +185,29 @@ function initPostgres () {
 }
 
 function figureOutWhereWeLeftOff () {
-    knex('load_log').min('seq').where("processing", 1).exec(function (err, res) {
-        if (err) maybeSay(err);
-        if (res && res[0] && res[0].min) {
-            startingSeq = res[0].min - 1;
-            maybeSay("starting at sequence: " + startingSeq);
-            maybeEmptyPostgres();
-        } else {
-            knex('load_log').max('seq').exec(function (err, res) {
-                if (err) maybeSay(err);
-                if (res && res[0] && res[0].max) {
-                    startingSeq = res[0].max;
-                }
-                maybeSay("starting at sequence: " + startingSeq);
-                maybeEmptyPostgres();
-            });
+    pg.connect(conString, function(err, client, done) {
+        if (err) {
+            // error connecting to postgres? we won't get far. Just die here
+            throw err;
         }
+        client.query('SELECT MIN(seq) AS minseq FROM load_log WHERE processing = CAST(1 AS BIT)', function (err, result) {
+            if (err) maybeSay(err);
+            if (result && result.rows && result.rows[0] && result.rows[0].minseq) {
+                startingSeq = result.rows[0].minseq - 1;
+                done(); // release connection back to pool
+                maybeEmptyPostgres();
+            } else {
+                client.query('SELECT MAX(seq) AS maxseq FROM load_log', function (err, result) {
+                    if (err) maybeSay(err);
+                    if (result.rows[0] && result.rows[0].maxseq) {
+                        startingSeq = result.rows[0].maxseq;
+                    }
+                    done();
+                    maybeEmptyPostgres();
+                });
+            }
+        });
     });
-    
 }
 
 function maybeEmptyPostgres () {
@@ -202,7 +236,8 @@ function maybeEmptyPostgres () {
 /*  Starts following the CouchDB
 ============================================================================= */
 function followCouch () {
-    maybeSay("starting on sequence " + startingSeq);
+    maybeSay("Starting on sequence " + startingSeq);
+    maybeSay('Type "stop" at any time to safetly stop the feed processing.');
     var opts = {
         db: couchUrl,
         since: startingSeq, 
@@ -228,17 +263,12 @@ function followCouch () {
     });
     
     feed.on('confirm', function (db) {
-        maybeSay("npm db confirmed:");
-        maybeSay(db); 
-        //db.doc_count;
-        //db.doc_del_count;
-        //db.disk_size;
-        //db.data_size;
-        //db.update_seq;
+        maybeSay("npm db confirmed...");
+        maybeSay("Starting feed processing.");
     });
     
     feed.on('catchup', function (seq_id) {
-        maybeSay('all caught up. last sequence: ' + seq_id);
+        maybeSay('All caught up. Last sequence: ' + seq_id);
         if (onCatchup) onCatchup();
     });
 
@@ -267,7 +297,7 @@ function onChangeReceived (change, cb) {
     
     // Every n changes we should log something interesting to look at.
     // like change count and inserts per second, for fun
-    if (changeCount % 100 === 0) {
+    if (changeCount % 1000 === 0) {
         metricsEndTime = new Date();
         var seconds = (metricsEndTime - metricsBeginTime) / 1000;
         var insertsPerSecond = Math.round(insertCount / seconds);
@@ -296,13 +326,27 @@ function onChangeReceived (change, cb) {
                     packagesProcessing[data.packageName] = data.packageName;
                     next(null, data);
                 } else {
-                    maybeSay("already processing a change for " + data.packageName + ". waiting a sec...");
+                    maybeSay("Already processing a change for " + data.packageName + ". waiting a sec...");
                     setTimeout(continueIfOpen, 10000);
                 }
             }
             continueIfOpen();
         },
+        function getClientFromPool (data, next) {
+            pg.connect(conString, function(err, client, done) {
+                if (err) {
+                    // error connecting to postgres? we won't get far. Just die here
+                    throw err;
+                } 
+                // assign the client and done function to the data object. 
+                // its going to get passed around and used here and there.
+                data.client = client;
+                data.done = done;
+                next(null, data);
+            });    
+        },
         function startLoadLog (data, next) {
+            var client = data.client;
             data.inserts_start = new Date();
             data.inserts_finish = null;
             // NOTE: the load log stuff should happen outside the transaction.
@@ -311,23 +355,23 @@ function onChangeReceived (change, cb) {
                 seq: data.seq,
                 package_name: data.packageName,
                 inserts_start: data.inserts_start,
-                processing: 1
+                processing: '1'
             };
-            knex("load_log").select("seq").where("seq", data.seq).exec(function (err, res) {
+            client.query("SELECT seq FROM load_log WHERE seq = $1", [data.seq], function (err, result) {
                 if (err) {
                     next(err, data);
                 } else {
-                    if (res && res.length) {
+                    var sql;
+                    if (result.rows.length) {
                         // do an update
-                        knex("load_log").where("seq", data.seq).update(loadLog).exec(function (err, res) {
-                            next(err, data);
-                        });
+                        sql = update('load_log', loadLog).where({"seq": data.seq}).toString();
                     } else {
-                        // do an insert
-                        knex("load_log").insert(loadLog).exec(function (err, res) {
-                            next(err, data);
-                        });
+                        //do an insert
+                        sql = insert('load_log', loadLog).toString();
                     }
+                    client.query(sql, function(err, result) {
+                        next(err, data);
+                    });
                 }
             });
         },
@@ -338,7 +382,7 @@ function onChangeReceived (change, cb) {
                 version_latest:    (doc["dist-tags"] ? doc["dist-tags"].latest : null),
                 version_rc:        (doc["dist-tags"] ? doc["dist-tags"].rc : null),
                 _rev:              doc._rev,
-                readme:            doc.readme,
+                readme:            ensureString(doc.readme, "readme"),
                 readme_filename:   doc.readmeFilename,
                 time_created:      (doc.time ? new Date(doc.time.created) : null),
                 time_modified:     (doc.time ? new Date(doc.time.modified) : null)
@@ -346,23 +390,21 @@ function onChangeReceived (change, cb) {
             next(null, data);
         },
         function getAllVersionsForPackageFromDb (data, next) {
+            var client = data.client;
             data.versionsInDb = {};
-            knex("version")
-                .select("version")
-                .where("package_name", data.packageData.package_name)
-                .exec(function (err, res) {
-                    if (err) {
-                        next(err);
-                    } else {
-                       if (res && res.length) {
-                           for (var record = 0; record < res.length; record++) {
-                               var version = res[record].version;
-                               data.versionsInDb[version] = version;
-                           }
-                       }
-                       next(null, data);
+            client.query("SELECT version FROM version WHERE package_name = $1", [data.packageData.package_name], function (err, result) {
+                if (err) {
+                    next(err, data);
+                } else {
+                    if (result.rows.length) {
+                        for (var record = 0; record < result.rows.length; record++) {
+                            var version = result.rows[record].version;
+                            data.versionsInDb[version] = version;
+                        }
                     }
-                });
+                    next(null, data);
+                }
+            });
         },
         function assembleVersionData (data, next) {
             var doc = data.doc;
@@ -381,28 +423,79 @@ function onChangeReceived (change, cb) {
                 if (!data.versionsInDb[v]) {
                     var dv = doc.versions[v];
                     var versionParts = getVersionParts(v);
+                    
+                    // clean up some of the problematic data
+                    var cleanLicense = ""
+                    if (typeof dv.license === "string") {
+                        cleanLicense = dv.license;
+                    } else if (dv.license instanceof Array) {
+                        // if this is an array of strings, simply join the list of
+                        // licenses together. not optimal or good db design, 
+                        // but its something
+                        if (typeof dv.license[0] === "string") {
+                            cleanLicense = dv.license.join(", ");
+                        }
+                        // if this license is an array of objects, 
+                        // attempt to build a license via name or type of that object
+                        else if (dv.license[0] && (dv.license[0].type || dv.license[0].name)) {
+                            var licenses = [];
+                            for (var i = 0; i < dv.license.length; i++) {
+                                licenses.push(dv.license[i].type || dv.license[i].name || dv.license[i].url || "");
+                            }
+                            cleanLicense = licenses.join(", ");
+                        }
+                    } else if (dv.license && (dv.license.type || dv.license.name || dv.license.url)) {
+                        cleanLicense = dv.license.type || dv.license.name || dv.license.url;
+                    }
+                    
+                    // clean up homepage
+                    var cleanHomepage = "";
+                    if (typeof dv.homepage === "string") {
+                        cleanHomepage = dv.homepage;
+                    } else if (dv.homepage && dv.homepage.url) {
+                        cleanHomepage = dv.homepage.url;  
+                    } else if (dv.homepage instanceof Array && typeof dv.homepage[0] === "string") {
+                        cleanHomepage = dv.homepage.join(", ")
+                    } else if (dv.homepage instanceof Array && dv.homepage[0] && dv.homepage[0].url) {
+                        var urls = [];
+                        for (var i = 0; i < dv.homepage.length; i++) {
+                            urls.push(dv.homepage[i].url);
+                        }
+                        cleanHomepage = urls.join(", ");
+                    } else {
+                        cleanHomepage = dv.homepage;
+                    }
+                    
+                    // clean up description
+                    var cleanDescription = dv.description;
+                    if (typeof dv.description === "string") {
+                        cleanDescription = dv.description;
+                    } else if (dv.description instanceof Array) {
+                        cleanDescription = dv.description.join(" ");
+                    }
+                    
                     var version = {
                         package_name:        doc._id,
                         version:             v,
-                        description:         dv.description,
+                        description:         ensureString(cleanDescription, "description"),
                         author_name:         (dv.author ? dv.author.name : null),
                         author_email:        (dv.author ? dv.author.email : null),
                         author_url:          (dv.author ? dv.author.url : null),
-                        repository_type:     (dv.repository ? dv.repository.type : null),
-                        repository_url:      (dv.repository ? dv.repository.url : null),
-                        main:                dv.main,
-                        license:             dv.license,
-                        homepage:            dv.homepage,
+                        repository_type:     (dv.repository ? ensureString(dv.repository.type, "repository.type") : null),
+                        repository_url:      (dv.repository ? ensureString(dv.repository.url, "repository.url") : null),
+                        main:                ensureString(dv.main, "dv.main"),
+                        license:             ensureString(cleanLicense, "license"),
+                        homepage:            ensureString(cleanHomepage, "homepage"),
                         bugs_url:            (dv.bugs ? dv.bugs.url : null),
                         bugs_homepage:       (dv.bugs ? dv.bugs.homepage : null),
                         bugs_email:          (dv.bugs ? dv.bugs.email : null),
-                        engine_node:         (dv.engines ? dv.engines.node : null),
-                        engine_npm:          (dv.engines ? dv.engines.npm : null),
-                        dist_shasum:         (dv.dist ? dv.dist.shasum : null),
-                        dist_tarball:        (dv.dist ? dv.dist.tarball : null),
-                        _from:               dv._from,
-                        _resolved:           dv._resolved,
-                        _npm_version:        dv._npmVersion,
+                        engine_node:         (dv.engines ? ensureString(dv.engines.node, "engines.node") : null),
+                        engine_npm:          (dv.engines ? ensureString(dv.engines.npm, "engines.npm") : null),
+                        dist_shasum:         (dv.dist ? ensureString(dv.dist.shasum, "dist.shasum") : null),
+                        dist_tarball:        (dv.dist ? ensureString(dv.dist.tarball, "dist.tarball") : null),
+                        _from:               ensureString(dv._from, "_from"),
+                        _resolved:           ensureString(dv._resolved, "_resolved"),
+                        _npm_version:        ensureString(dv._npmVersion, "_npm_version"),
                         _npm_user_name:      (dv._npmUser ? dv._npmUser.name : null),
                         _npm_user_email:     (dv._npmUser ? dv._npmUser.email : null),
                         time_created:        (doc.time ? new Date(doc.time[v]) : null),
@@ -410,7 +503,7 @@ function onChangeReceived (change, cb) {
                         version_major:       versionParts.major,
                         version_minor:       versionParts.minor,
                         version_label:       versionParts.label,
-                        version_is_stable:   (versionParts.isStable ? 1 : 0)
+                        version_is_stable:   (versionParts.isStable ? '1' : '0') // was ints not string
                     };
                     data.inserts.version.push(version);
                     
@@ -450,8 +543,8 @@ function onChangeReceived (change, cb) {
                             data.inserts.version_dependency.push({
                                 package_name: doc._id,
                                 version: v,
-                                dependency_name: d,
-                                dependency_version: dv.dependencies[d]
+                                dependency_name: ensureString(d, "dependency_name"),
+                                dependency_version: ensureString(dv.dependencies[d], "dependency_version")
                             });
                         }
                     }
@@ -462,8 +555,8 @@ function onChangeReceived (change, cb) {
                             data.inserts.version_dev_dependency.push({
                                 package_name: doc._id,
                                 version: v,
-                                dev_dependency_name: devdep,
-                                dev_dependency_version: dv.devDependencies[devdep]
+                                dev_dependency_name: ensureString(devdep, "dev_dependency_name"),
+                                dev_dependency_version: ensureString(dv.devDependencies[devdep], "dev_dependency_version")
                             });
                         }
                     }
@@ -506,7 +599,7 @@ function onChangeReceived (change, cb) {
                                 package_name: doc._id,
                                 version: v,
                                 script_name: s,
-                                script_text: dv.scripts[s]
+                                script_text: ensureString(dv.scripts[s], "script_text")
                             });
                         }
                     }
@@ -518,51 +611,62 @@ function onChangeReceived (change, cb) {
             
         }, // end function assembleVersionData
         function beginTransaction (data, next) {
-            
-            knex.transaction(function(t) {
-                data.tran = t;
-                next(null, data);
-            }).then(function(resp) {
-                //console.log('Transaction complete.');
-            }).catch(function(err) {
-                console.log("rolled back " + data.packageData.package_name);
-                //console.error(err);
+            var client = data.client;
+            client.query("BEGIN", function (err, result) {
+                if (!err) {
+                    data.tran = true;
+                }
+                next(err, data);
             });
         }, 
         function updateOrInsertPackage (data, next) {
-            var tran = data.tran;
+            var client = data.client;
             var pkg = data.packageData;
-            knex("package")
-                .transacting(tran)
-                .select("package_name")
-                .where("package_name", pkg.package_name)
-                .exec(function (err, res) {
-                    if (err) {
-                        next(err, data);
+            
+            client.query("SELECT package_name FROM package WHERE package_name = $1", [pkg.package_name], function (err, result) {
+                if (err) {
+                    next(err, data);
+                } else {
+                    var sql;
+                    var sqlBuildError;
+                    if (result.rows.length) {
+                        // package found do update
+                        try {
+                            sql = update("package", pkg).where({"package_name": pkg.package_name}).toString();
+                        }
+                        catch (e) {
+                            sqlBuildError = e;
+                            console.log(pkg);
+                            console.log(e);
+                        }
                     } else {
-                       if (res && res.length) {
-                           // package found. gonna update
-                           knex("package").transacting(tran).where("package_name", pkg.package_name).update(pkg).exec(function (err) {
-                               if (err) next(err, data);
-                               else next(null, data);
-                           });
-                       } else {
-                           // no package found, gonna insert
-                           knex("package").transacting(tran).insert(pkg).exec(function(err) {
-                               if (err) next(err, data);
-                               else next(null, data);
-                           });
-                       } 
+                        // no package found, do insert
+                        try {
+                            sql = insert("package", pkg).toString();
+                        }
+                        catch (e) {
+                            sqlBuildError = e;
+                            console.log(pkg);
+                            console.log(e);
+                        }
                     }
-                });
+                    if (sqlBuildError) {
+                        next(sqlBuildError, data);
+                    } else {
+                        client.query(sql, function (err, result) {
+                            next(err, data);
+                        });
+                    }
+                }
+            });
         },
         function doVersionInserts (data, next) {
             var versionsData = [];
             for (var tablename in data.inserts) {
                 versionsData.push({
                     tablename: tablename,
-                    tran: data.tran,
-                    rows: data.inserts[tablename]
+                    rows: data.inserts[tablename],
+                    client: data.client
                 });
             }
             async.eachSeries(versionsData, versionToPg, function (err) {
@@ -580,30 +684,56 @@ function onChangeReceived (change, cb) {
         }
         */
     ], function theEndOfProcessingAChange (err, data) {
+        var client = data.client;
+        var done = data.done;
         data.inserts_finish = new Date();
-        // Update the inserts_finish time, as well as change the processing bit to false.
-        // This needs to happen regardless of error or not. 
-        var loadLog = {
-            seq: data.seq,
-            package_name: data.packageName,
-            version_latest: data.packageData.version_latest,
-            inserts_start: data.inserts_start,
-            inserts_finish: data.inserts_finish,
-            processing: 0
-        };
-        knex("load_log").where("seq", data.seq).update(loadLog).exec(function (err, res) {
-            if (err) {
-                takeNote("Error Finalizing load_log", data.packageName, err);
-                maybeSay("Error Finalizing load_log for package " + data.packageName);
-            }
-        });
         
         if (err) {
             takeNote("versions import (unsure where)", data.packageName, err);
             maybeSay("An insert failed somewhere - check log for details");
-            maybeSay("rolling back");
-            if (data.tran) data.tran.rollback();
             errorCount++;
+            if (data.tran) {
+                maybeSay("rolling back");
+                client.query("ROLLBACK", function (err, result) {
+                    lastLoadLog();
+                });
+            } else {
+                // there wasn't a transaction. we didn't make it far.
+                // wrap this up and do another (maybe);
+                lastLoadLog();
+            }    
+        } else {
+            client.query("COMMIT", function (err, result) {
+                lastLoadLog();
+            });
+        }
+        
+        function lastLoadLog () {
+            // Update the inserts_finish time, as well as change the processing bit to false.
+            // This needs to happen regardless of error or not. 
+            var loadLog = {
+                seq: data.seq,
+                package_name: data.packageName,
+                version_latest: data.packageData.version_latest,
+                inserts_start: data.inserts_start,
+                inserts_finish: data.inserts_finish,
+                processing: '0'
+            };
+            var sql = update("load_log", loadLog).where({"seq": data.seq}).toString();
+            client.query(sql, function (loadLogError, result) {
+                if (loadLogError) {
+                    takeNote("Error Finalizing load_log", data.packageName, err);
+                    maybeSay("Error Finalizing load_log for package " + data.packageName);
+                }
+                wrapThisChangeUp();
+            });
+        }
+        
+        function wrapThisChangeUp () {
+            done();
+            // record that we are no longer processing a change for this package
+            if (packagesProcessing[data.packageName]) delete packagesProcessing[data.packageName];
+            
             if (errorCount < errorLimit) {
                 cb();
             } else {
@@ -611,12 +741,8 @@ function onChangeReceived (change, cb) {
                 feed.stop();
                 process.exit();
             }
-        } else {
-            if (data.tran) data.tran.commit('');
-            cb();
-        }
-        // record that we are no longer processing a change for this package
-        if (packagesProcessing[data.packageName]) delete packagesProcessing[data.packageName];
+        };
+        
     });
     
 } // end  onChangeReceived
@@ -627,10 +753,33 @@ function onChangeReceived (change, cb) {
 function versionToPg (tableInfo, callback) {
     if (tableInfo.rows && tableInfo.rows.length) {
         insertCount = insertCount + tableInfo.rows.length;
-        knex(tableInfo.tablename)
-            .transacting(tableInfo.tran)
-            .insert(tableInfo.rows)
-            .exec(callback);
+        var client = tableInfo.client;
+        var sql;
+        var sqlBricksErr;
+        var sqlBricksErrText;
+        try {
+            sql = insert(tableInfo.tablename, tableInfo.rows).toString();    
+        } 
+        catch (e) {
+            sqlBricksErr = e;
+            sqlBricksErrText = "\n\n"
+                + "tableInfo.tablename:\n"
+                + tableInfo.tablename + "\n"
+                + "tableInfo.rows:\n"
+                + JSON.stringify(tableInfo.rows, null, 2)
+                + "\n\n"
+                + JSON.stringify(e)
+            takeNote("Error generating sql", tableInfo.tablename, e);
+            fs.appendFile(fixFile, sqlBricksErrText, function (err) {
+                if (err) console.log("ERROR ERROR ERROR! Couldn't write to FIX FILE!!! :(");
+            });
+        }
+        if (sqlBricksErr) {
+            // if there was a sqlBricksErr, skip this round of inserts
+            callback(sqlBricksErr);
+        } else {
+            client.query(sql, callback);
+        }
     } else {
         // move on to the next one, nothing to insert here
         callback(); 
