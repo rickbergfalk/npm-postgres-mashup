@@ -4,3 +4,5 @@
 /test.js
 /test*.js
 fix-log.txt
+npm2pg-fix-log.txt
+npm2pg-error-log.txt
