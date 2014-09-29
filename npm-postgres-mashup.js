@@ -24,8 +24,8 @@ var postgresUser;
 var postgresPassword;
 var postgresDatabase;
 var beNoisy = false;              // if set to true we'll console.log progress
-var logFile = __dirname + "/error-log.txt";
-var fixFile = __dirname + "/fix-log.txt";
+var logFile = process.cwd() + "/npm2pg-error-log.txt";
+var fixFile = process.cwd() + "/npm2pg-fix-log.txt";
 var onCatchup;
 
 var schemaversion = '010';
