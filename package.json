@@ -2,7 +2,7 @@
   "name": "npm-postgres-mashup",
   "author": "Rick Bergfalk <rick.bergfalk@gmail.com>",
   "description": "Replicate most of the npm skimdb registry to a relational model inside Postgres. Now with continuous replication and more efficiency and cli!",
-  "version": "15.17.1",
+  "version": "16.0.0",
   "main": "npm-postgres-mashup",
   "keywords": [
     "npm",
