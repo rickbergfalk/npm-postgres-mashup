@@ -672,17 +672,17 @@ function onChangeReceived (change, cb) {
             async.eachSeries(versionsData, versionToPg, function (err) {
                 next(err, data);
             });
-        }
-        /*
-        ,
+        },
         function doPreviousStableUpdate (data, next) {
-            knex.raw("select update_previous_versions(?)", [data.packageData.package_name]).exec(function(err) {
-                if (err) next(err, data);
-                else next(null, data);
+            var client = data.client;
+            client.query("SELECT update_previous_versions($1)", [data.packageData.package_name], function (err, result) {
+                if (err) {
+                    next(err, data);
+                } else {
+                    next(null, data);
+                }
             });
-            
         }
-        */
     ], function theEndOfProcessingAChange (err, data) {
         var client = data.client;
         var done = data.done;
