@@ -3,3 +3,4 @@ node_modules/
 .zedstate
 error-log.txt
 test*
+fix-log.txt
