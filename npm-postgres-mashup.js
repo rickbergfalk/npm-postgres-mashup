@@ -28,7 +28,7 @@ var logFile = process.cwd() + "/npm2pg-error-log.txt";
 var fixFile = process.cwd() + "/npm2pg-fix-log.txt";
 var onCatchup;
 
-var schemaversion = '010';
+var schemaversion = '013';
 
 var feed; // follow feed
 var startingSeq = 1;
@@ -455,7 +455,7 @@ function onChangeReceived (change, cb) {
                     } else if (dv.homepage && dv.homepage.url) {
                         cleanHomepage = dv.homepage.url;  
                     } else if (dv.homepage instanceof Array && typeof dv.homepage[0] === "string") {
-                        cleanHomepage = dv.homepage.join(", ")
+                        cleanHomepage = dv.homepage.join(", ");
                     } else if (dv.homepage instanceof Array && dv.homepage[0] && dv.homepage[0].url) {
                         var urls = [];
                         for (var i = 0; i < dv.homepage.length; i++) {
