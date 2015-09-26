@@ -10,6 +10,7 @@ var select = require('sql-bricks').select;
 var insert = require('sql-bricks').insert;
 var update = require('sql-bricks').update;
 var pg = require('pg.js');
+var downloadCounts = require('npm-download-counts');
 var conString = "";
 
 
@@ -28,7 +29,7 @@ var logFile = process.cwd() + "/npm2pg-error-log.txt";
 var fixFile = process.cwd() + "/npm2pg-fix-log.txt";
 var onCatchup;
 
-var schemaversion = '013';
+var schemaversion = '016';
 
 var feed; // follow feed
 var startingSeq = 1;
@@ -36,7 +37,10 @@ var emptyPostgres = false;
 
 var parallelLimit = 8;    // number of changes we'll process at once
 var changesProcessing = 0; // used to track number of changes that are currently processing
-
+var downloadsProcessing = 0; 
+var doDownloads = true;
+var couchCaughtUp = false;
+var downloadsCaughtUp = false;
 
 /*  Manage Flow
     stops/starts feed based on how many changes are currently being processed.
@@ -97,12 +101,13 @@ function takeNote (doingWhat, package_name, error) {
     been made, we call the callback.
 ============================================================================= */
 exports.stopFeedAndProcessing = function (cb) {
+    doDownloads = false;
     if (feed) {
         feed.stop();
     }
     var attempts = 0;
     function loopUntilFinished () {
-        if (changesProcessing === 0 || attempts > 60) {
+        if ((changesProcessing === 0 && downloadsProcessing === 0) || attempts > 60) {
             cb();
         } else {
             attempts++;
@@ -210,28 +215,190 @@ function figureOutWhereWeLeftOff () {
     });
 }
 
+function truncateTables (cb) {
+    var truncateSql = "TRUNCATE TABLE version_script; \n"
+    + "TRUNCATE TABLE version_maintainer; \n"
+    + "TRUNCATE TABLE version_keyword; \n"
+    + "TRUNCATE TABLE version_dev_dependency; \n"
+    + "TRUNCATE TABLE version_dependency; \n"
+    + "TRUNCATE TABLE version_contributor; \n"
+    + "TRUNCATE TABLE version_bin; \n"
+    + "TRUNCATE TABLE version; \n"
+    + "TRUNCATE TABLE download_count; \n"
+    + "TRUNCATE TABLE package; \n";
+    pg.connect(conString, function(err, client, done) {
+        if (err) {
+            console.log("error connecting before truncate:");
+            console.log(err);
+            done();
+            cb();
+        } else {
+            client.query(truncateSql, function (err, result) {
+                if (err) {
+                    console.log("error running truncate sql:");
+                    console.log(err);
+                }
+                done();
+                cb();
+            });
+        }
+    });
+}
+
 function maybeEmptyPostgres () {
-    
     if (startingSeq === 1 || emptyPostgres) {
         if (startingSeq > 1) startingSeq = 1;
         maybeSay("Either sequence history is not available, or you opted to empty postgres");
-        postgrator.migrate('000', function (err) {
-            if (err) { 
-                takeNote("Migrating down to 000", "", err);
-                throw(err); // if we can't migrate there is no use going forward
-            }
-            postgrator.migrate(schemaversion, function (err) {
-                if (err) {
-                    takeNote("Migrating up to " + schemaversion, "", err);
-                    throw(err);
+        truncateTables(function () {
+            postgrator.migrate('000', function (err) {
+                if (err) { 
+                    takeNote("Migrating down to 000", "", err);
+                    throw(err); // if we can't migrate there is no use going forward
                 }
-                followCouch();
+                postgrator.migrate(schemaversion, function (err) {
+                    if (err) {
+                        takeNote("Migrating up to " + schemaversion, "", err);
+                        throw(err);
+                    }
+                    followCouch();
+                    gatherDownloadCounts();
+                });
             });
         });
     } else {
         followCouch();
+        gatherDownloadCounts();
     }
 }
+
+/*  Starts the download count gatherer
+    This gatherer isn't the most efficient, but thats okay
+    because this approach hopefully won't bombard the download counts service
+    it is self throttling in a way. hopefully.
+============================================================================= */
+function gatherDownloadCounts () {
+    maybeSay("Starting Download Counts");
+    function processNextBatch () {
+        if (doDownloads) {
+            getDownloadCountBatch(function (err, result) {
+                if (result.rows && result.rows.length) {
+                    async.each(result.rows, getDownloadsForPackage, function (err) {
+                        if (err) console.log(err);
+                        processNextBatch();
+                    });
+                } else {
+                    // no packages to process
+                    console.log("all caught up with download counts?");
+                    if (downloadsProcessing === 0) downloadsCaughtUp = true;
+                    if (onCatchup && couchCaughtUp && downloadsProcessing === 0) onCatchup();
+                }
+            });
+        }
+    }
+    setTimeout(processNextBatch, 10000);
+}
+
+function getDownloadCountBatch (cb) {
+    var getPackageSql = "SELECT p.package_name, COALESCE(p.last_download_count_day + INTERVAL '1 Day', p.time_created) AS start_date, DATE 'yesterday' AS end_date "
+        + "FROM package p "
+        + "WHERE p.last_download_count_day IS NULL OR p.last_download_count_day < DATE 'yesterday' "
+        + "LIMIT 200";
+    
+    pg.connect(conString, function(err, client, done) {
+        if (err) {
+            console.log("error connecting for process_next_package:");
+            console.log(err);
+            done();
+            cb(err);
+        } else {
+            client.query(getPackageSql, function (err, result) {
+                done();
+                cb(err, result);
+            });
+        }
+    });
+}
+
+function getDownloadsForPackage (packageInfo, cb) {
+    var package_name = packageInfo.package_name;
+    var start_date = packageInfo.start_date;
+    var end_date = packageInfo.end_date;
+    downloadCounts(package_name, start_date, end_date, function (err, data) {
+        if (err || !data) {
+            // most likely there was no data for this range
+            // despite this error, we just want to skip it
+            pg.connect(conString, function (err, client, done) {
+                client.query("UPDATE package SET last_download_count_day = DATE 'yesterday' WHERE package_name = $1;", [package_name], function (err, result) {
+                    if (err) {
+                        console.log("error updating last_download_count_day for " + package_name);
+                        console.log(err);
+                    }
+                    done();
+                    cb();
+                });
+            });
+        } else {
+            var insertSet = [];
+            data.forEach(function (row) {
+                insertSet.push({
+                    package_name: package_name,
+                    download_date: row.day,
+                    download_count: row.count
+                });
+            });
+            var sql;
+            var sqlBricksErr;
+            try {
+                sql = insert("download_count", insertSet).toString();    
+            } 
+            catch (e) {
+                sqlBricksErr = e;
+                var sqlBricksErrText = "\n\n"
+                    + "tableInfo.tablename:\n"
+                    + "download_count" + "\n"
+                    + "tableInfo.rows:\n"
+                    + JSON.stringify(insertSet, null, 2)
+                    + "\n\n"
+                    + JSON.stringify(e);
+                takeNote("Error generating sql", "download_count", e);
+                fs.appendFile(fixFile, sqlBricksErrText, function (err) {
+                    if (err) console.log("ERROR ERROR ERROR! Couldn't write to FIX FILE!!! :(");
+                });
+            }
+            if (sqlBricksErr) {
+                console.log("Download count error, retrying in 10 sec.");
+                console.log(sqlBricksErr);
+                cb();
+            } else {
+                console.log("running counts for " + package_name);
+                downloadsProcessing = downloadsProcessing + 1;
+                pg.connect(conString, function (err, client, done) {
+                    client.query(sql, function (err, result) {
+                        if (err) {
+                            console.log("error running download count insert sql:");
+                            console.log(err);
+                            done();
+                            cb();
+                        } else {
+                            client.query("UPDATE package SET last_download_count_day = DATE 'yesterday' WHERE package_name = $1;", [package_name], function (err, result) {
+                                if (err) {
+                                    console.log("error updating last_download_count_day for " + package_name);
+                                    console.log(err);
+                                }
+                                downloadsProcessing = downloadsProcessing - 1;
+                                done();
+                                cb();
+                            });
+                        }
+                    });
+                });
+            }
+        }
+    });
+}
+
+
+
 
 /*  Starts following the CouchDB
 ============================================================================= */
@@ -269,7 +436,8 @@ function followCouch () {
     
     feed.on('catchup', function (seq_id) {
         maybeSay('All caught up. Last sequence: ' + seq_id);
-        if (onCatchup) onCatchup();
+        couchCaughtUp = true;
+        if (onCatchup && downloadsCaughtUp) onCatchup();
     });
 
     feed.follow();
