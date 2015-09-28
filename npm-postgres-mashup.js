@@ -16,8 +16,8 @@ var conString = "";
 
 /*     Variables for Later
 ============================================================================= */
-var changeCount = 0;              // every time we begin to process a change, this will be incremented
-var errorLimit = 20;              // If this many errors happen, we'll stop persisting to postgres and quit
+var changeCount = 0;    // every time we begin to process a change, this will be incremented
+var errorLimit = 20;    // If this many errors happen, we'll stop persisting to postgres and quit
 var errorCount = 0;
 var couchUrl;
 var postgresHost;
@@ -89,7 +89,7 @@ function takeNote (doingWhat, package_name, error) {
     maybeSay(errorHeader);
     fs.appendFile(logFile, errorHeader + JSON.stringify(error, null, 2), function (err) {
         if (err) {
-            console.log("ERROR ERROR ERROR!!!    takeNote() couldn't write to the file");
+            console.error("ERROR ERROR ERROR!!!    takeNote() couldn't write to the file");
         }
     });
 }
@@ -157,7 +157,6 @@ exports.copyTheData = function (config) {
     fs.writeFileSync(fixFile, "", {encoding: 'utf8'});
     
     conString = "tcp://" + postgresUser + ":" + postgresPassword + "@" + postgresHost + "/" + postgresDatabase;
-    console.log(conString);
     
     initPostgres();                
 };
@@ -228,15 +227,15 @@ function truncateTables (cb) {
     + "TRUNCATE TABLE package; \n";
     pg.connect(conString, function(err, client, done) {
         if (err) {
-            console.log("error connecting before truncate:");
-            console.log(err);
+            console.error("error connecting before truncate:");
+            console.error(err);
             done();
             cb();
         } else {
             client.query(truncateSql, function (err, result) {
                 if (err) {
-                    console.log("error running truncate sql:");
-                    console.log(err);
+                    console.error("error running truncate sql:");
+                    console.error(err);
                 }
                 done();
                 cb();
@@ -277,24 +276,28 @@ function maybeEmptyPostgres () {
     it is self throttling in a way. hopefully.
 ============================================================================= */
 function gatherDownloadCounts () {
-    maybeSay("Starting Download Counts");
     function processNextBatch () {
         if (doDownloads) {
+            var startTime = new Date();
             getDownloadCountBatch(function (err, result) {
                 if (result.rows && result.rows.length) {
-                    async.each(result.rows, getDownloadsForPackage, function (err) {
-                        if (err) console.log(err);
+                    async.eachLimit(result.rows, 10, getDownloadsForPackage, function (err) {
+                        if (err) console.error(err);
+                        var endTime = new Date();
+                        var seconds = (endTime - startTime) / 1000;
+                        maybeSay("Download counts for 1000 packages in " + seconds + " seconds.");
                         processNextBatch();
                     });
                 } else {
                     // no packages to process
-                    console.log("all caught up with download counts?");
+                    maybeSay("All caught up with download counts");
                     if (downloadsProcessing === 0) downloadsCaughtUp = true;
                     if (onCatchup && couchCaughtUp && downloadsProcessing === 0) onCatchup();
                 }
             });
         }
     }
+    maybeSay("Starting Download Counts in 10 seconds...");
     setTimeout(processNextBatch, 10000);
 }
 
@@ -302,12 +305,12 @@ function getDownloadCountBatch (cb) {
     var getPackageSql = "SELECT p.package_name, COALESCE(p.last_download_count_day + INTERVAL '1 Day', p.time_created) AS start_date, DATE 'yesterday' AS end_date "
         + "FROM package p "
         + "WHERE p.last_download_count_day IS NULL OR p.last_download_count_day < DATE 'yesterday' "
-        + "LIMIT 200";
+        + "LIMIT 1000";
     
     pg.connect(conString, function(err, client, done) {
         if (err) {
-            console.log("error connecting for process_next_package:");
-            console.log(err);
+            console.error("error connecting for process_next_package:");
+            console.error(err);
             done();
             cb(err);
         } else {
@@ -330,8 +333,8 @@ function getDownloadsForPackage (packageInfo, cb) {
             pg.connect(conString, function (err, client, done) {
                 client.query("UPDATE package SET last_download_count_day = DATE 'yesterday' WHERE package_name = $1;", [package_name], function (err, result) {
                     if (err) {
-                        console.log("error updating last_download_count_day for " + package_name);
-                        console.log(err);
+                        console.error("error updating last_download_count_day for " + package_name);
+                        console.error(err);
                     }
                     done();
                     cb();
@@ -362,28 +365,27 @@ function getDownloadsForPackage (packageInfo, cb) {
                     + JSON.stringify(e);
                 takeNote("Error generating sql", "download_count", e);
                 fs.appendFile(fixFile, sqlBricksErrText, function (err) {
-                    if (err) console.log("ERROR ERROR ERROR! Couldn't write to FIX FILE!!! :(");
+                    if (err) console.error("ERROR ERROR ERROR! Couldn't write to FIX FILE!!! :(");
                 });
             }
             if (sqlBricksErr) {
-                console.log("Download count error, retrying in 10 sec.");
-                console.log(sqlBricksErr);
+                console.error("Download count error, retrying in 10 sec.");
+                console.error(sqlBricksErr);
                 cb();
             } else {
-                console.log("running counts for " + package_name);
                 downloadsProcessing = downloadsProcessing + 1;
                 pg.connect(conString, function (err, client, done) {
                     client.query(sql, function (err, result) {
                         if (err) {
-                            console.log("error running download count insert sql:");
-                            console.log(err);
+                            console.error("error running download count insert sql:");
+                            console.error(err);
                             done();
                             cb();
                         } else {
                             client.query("UPDATE package SET last_download_count_day = DATE 'yesterday' WHERE package_name = $1;", [package_name], function (err, result) {
                                 if (err) {
-                                    console.log("error updating last_download_count_day for " + package_name);
-                                    console.log(err);
+                                    console.error("error updating last_download_count_day for " + package_name);
+                                    console.error(err);
                                 }
                                 downloadsProcessing = downloadsProcessing - 1;
                                 done();
