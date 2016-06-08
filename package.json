@@ -1,9 +1,10 @@
 {
-  "name": "npm-postgres-mashup",
+  "name": "npm2pg",
   "author": "Rick Bergfalk <rick.bergfalk@gmail.com>",
-  "description": "Replicate most of the npm skimdb registry to a relational model inside Postgres. Now with continuous replication and more efficiency and cli!",
+  "description": "Replicate the npm skimdb registry into Postgres JSONB",
   "version": "16.3.0",
   "main": "npm-postgres-mashup",
+  "license": "MIT",
   "keywords": [
     "npm",
     "postgres",
@@ -11,20 +12,20 @@
     "cli"
   ],
   "scripts": {
-    "test": "node test.js"
+    "test": "node ./bin/npm2pg.js -d npmpg -u npmpg -p npmpg --confirm-version 17"
   },
   "dependencies": {
-    "async": "0.9.x",
+    "async": "^1.5.2",
     "commander": "^2.3.0",
-    "follow": "0.11.x",
+    "follow": "^0.12.1",
+    "lodash": "^4.13.1",
+    "massive": "^2.3.0",
     "npm-download-counts": "^0.1.1",
-    "pg.js": "^3.4.4",
-    "postgrator": "0.2.x",
-    "sql-bricks": "^1.0.0-beta.2"
+    "pg": "^4.5.5"
   },
   "repository": {
     "type": "git",
-    "url": "git://github.com/rickbergfalk/npm-postgres-mashup.git"
+    "url": "git://github.com/rickbergfalk/npm2pg.git"
   },
   "bin": {
     "npm2pg": "./bin/npm2pg.js"
