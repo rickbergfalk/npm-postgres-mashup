@@ -2,7 +2,7 @@
   "name": "npm-postgres-mashup",
   "author": "Rick Bergfalk <rick.bergfalk@gmail.com>",
   "description": "Replicate the npm skimdb into Postgres JSONB",
-  "version": "17.0.0",
+  "version": "17.0.1",
   "main": "npm-postgres-mashup",
   "license": "MIT",
   "keywords": [
