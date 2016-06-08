@@ -1,7 +1,6 @@
 var fs = require('fs');
 var follow = require('follow');
 var async = require('async');
-var postgrator = require('postgrator');
 var pg = require('pg');
 var downloadCounts = require('npm-download-counts');
 var _ = require('lodash');
