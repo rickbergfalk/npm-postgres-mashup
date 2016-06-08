@@ -1,6 +1,11 @@
 .git*
-node_modules/
-.zedstate
-error-log.txt
-test*
+/node_modules
+/.zedstate
+/error-log.txt
+/test.js
+/test*.js
 fix-log.txt
+notes.txt
+npm2pg-fix-log.txt
+npm2pg-error-log.txt
+npm2pg-log.txt
