@@ -1,5 +1,5 @@
 {
-  "name": "npm2pg",
+  "name": "npm-postgres-mashup",
   "author": "Rick Bergfalk <rick.bergfalk@gmail.com>",
   "description": "Replicate the npm skimdb registry into Postgres JSONB",
   "version": "17.0.0",
