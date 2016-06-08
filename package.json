@@ -2,7 +2,7 @@
   "name": "npm2pg",
   "author": "Rick Bergfalk <rick.bergfalk@gmail.com>",
   "description": "Replicate the npm skimdb registry into Postgres JSONB",
-  "version": "16.3.0",
+  "version": "17.0.0",
   "main": "npm-postgres-mashup",
   "license": "MIT",
   "keywords": [
