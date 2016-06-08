@@ -1,1 +1,0 @@
-ALTER TABLE load_log DROP COLUMN processing;

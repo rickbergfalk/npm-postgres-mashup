@@ -1,9 +1,0 @@
-DROP TABLE IF EXISTS version_script;
-DROP TABLE IF EXISTS version_bin;
-DROP TABLE IF EXISTS version_keyword;
-DROP TABLE IF EXISTS version_dev_dependency;
-DROP TABLE IF EXISTS version_dependency;
-DROP TABLE IF EXISTS version_maintainer;
-DROP TABLE IF EXISTS version_contributor;
-DROP TABLE IF EXISTS version;
-DROP TABLE IF EXISTS package;
