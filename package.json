@@ -12,7 +12,7 @@
     "cli"
   ],
   "scripts": {
-    "test": "node ./bin/npm2pg.js -d npmpg -u npmpg -p npmpg --confirm-version 17"
+    "test": "node ./bin/npm2pg.js -d npmpg -u npmpg -p npmpg --reporting-tables"
   },
   "dependencies": {
     "async": "^1.5.2",

@@ -109,7 +109,10 @@ exports.copyTheData = function (config) {
     Finally, the function to start following CouchDB is called.
 ============================================================================= */
 function initPostgres () {
-    massiveInstance = massive.connectSync({connectionString : conString});
+    massiveInstance = massive.connectSync({
+        connectionString : conString,
+        scripts: __dirname + "/db"
+    });
     if (buildSchema) {
         massiveInstance.createSchema(function (err, result) {
             if (err) {
